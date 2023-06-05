@@ -1,0 +1,16 @@
+[package]
+name = "dm_automation_tool"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+simple_enum_macro = { path = "./simple_enum_macro" }
+eframe = "0.21.3"
+rand = "0.8.5"
+local-ip-address = "0.5.3"
+serde = { version = "1.0.163", features = ["derive"] }
+ron = "0.8.0"
+chrono = "0.4.24"
+displaydoc = "0.2.4"

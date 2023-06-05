@@ -1,0 +1,8 @@
+(
+    name: "Fighter", 
+    description: "#TODO Fighter fighty fight kill.", 
+    prime_reqs: [STR], 
+    hit_die: D8,
+    base_xp_cost: 2000,
+    saving_throw_progression_type: Fighter,
+)

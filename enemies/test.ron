@@ -1,0 +1,1 @@
+(name:"",description:"",hit_dice:Standard(1),base_armor_class:0,base_attack_throw:10,base_damage:One((amount:1,sides:4,modifier:0,modifier_type:Add,apply_modifier_to_all:false,drop:None,min_value:1)),xp:0,morale:0,categories:[],alignment:Neutral,saves:(petrification_paralysis:7,poison_death:10,blast_breath:4,staffs_wands:7,spells:5))

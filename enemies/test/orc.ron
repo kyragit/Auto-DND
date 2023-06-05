@@ -1,0 +1,1 @@
+(name:"Orc",description:"orc man go brrr",hit_dice:Standard(3),base_armor_class:5,base_attack_throw:12,base_damage:One((amount:1,sides:4,modifier:0,modifier_type:Add,apply_modifier_to_all:false,drop:None,min_value:1)),xp:30,morale:2,categories:[Humanoid,Beastman],alignment:Chaotic,saves:(petrification_paralysis:4,poison_death:9,blast_breath:10,staffs_wands:6,spells:4))

@@ -1,0 +1,8 @@
+(
+    name: "Mage", 
+    description: "#TODO Magic man spells David Blaine yer a wizard.", 
+    prime_reqs: [INT], 
+    hit_die: D4,
+    base_xp_cost: 2500,
+    saving_throw_progression_type: Mage,
+)

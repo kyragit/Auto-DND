@@ -1,0 +1,8 @@
+(
+    name: "Thief", 
+    description: "#TODO Sneaky steal stabby stab very trustworthy.", 
+    prime_reqs: [DEX], 
+    hit_die: D4,
+    base_xp_cost: 1250,
+    saving_throw_progression_type: Thief,
+)

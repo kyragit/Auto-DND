@@ -1,0 +1,1 @@
+(name:"Guard",description:"A royal guard.",hit_dice:Standard(2),base_armor_class:4,base_attack_throw:11,base_damage:One((amount:1,sides:6,modifier:1,modifier_type:Add,apply_modifier_to_all:false,drop:None,min_value:1)),xp:20,morale:2,categories:[Humanoid],alignment:Lawful,saves:(petrification_paralysis:6,poison_death:7,blast_breath:5,staffs_wands:5,spells:4))

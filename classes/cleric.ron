@@ -1,0 +1,8 @@
+(
+    name: "Cleric", 
+    description: "#TODO LMAO who actually plays this class.", 
+    prime_reqs: [WIS], 
+    hit_die: D6,
+    base_xp_cost: 1500,
+    saving_throw_progression_type: Cleric,
+)
