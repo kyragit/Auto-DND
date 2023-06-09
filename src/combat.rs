@@ -1,27 +1,32 @@
 use std::{collections::{HashMap, hash_map::Iter, HashSet}, ops::{AddAssign, SubAssign}, cmp::Ordering};
 
 use serde::{Serialize, Deserialize};
+use simple_enum_macro::simple_enum;
 
-use crate::{character::{Attributes, Health, SavingThrows}, dm_app::DMAppData, packets::{ClientBoundPacket, CombatAction}, dice::{self, DiceRoll}};
-
-
-pub trait Combatant<'s> {
-    fn get_combat_stats(&'s self) -> &'s CombatantStats;
-    fn get_combat_stats_mut(&'s mut self) -> &'s mut CombatantStats;
-}
+use crate::{character::{Attributes, Health, SavingThrows}, dm_app::DMAppData, packets::{ClientBoundPacket, CombatAction}, dice::{self, DiceRoll}, enemy::AttackRoutine};
 
 /// All the stats required for something to engage in combat. All of these are *base* stats, before
 /// any modifiers! This means `armor_class` will be zero for most characters, unless they have 
 /// innate armor! All modifiers are stored in `modifiers`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CombatantStats {
+    /// The combatant's base attributes (STR, DEX, etc.)
     pub attributes: Attributes,
+    /// The combatant's current and maximum health.
     pub health: Health,
+    /// The combatant's base attack throw bonus.
     pub attack_throw: i32,
+    /// The combatant's BASE armor class (this is often zero!)
     pub armor_class: i32,
-    pub damage: Damage,
+    /// The combatant's current base damage. This will change depending on what weapon they are 
+    /// holding.
+    pub damage: AttackRoutine,
+    pub attack_index: u32,
+    /// The combatant's base saving throw modifiers.
     pub saving_throws: SavingThrows,
+    /// Any ailments affecting this combatant.
     pub status_effects: StatusEffects,
+    /// All of the combatant's stat modifiers, from every source.
     pub modifiers: StatModifiers,
 }
 
@@ -39,12 +44,75 @@ impl CombatantStats {
             health: Health::new(),
             attack_throw: 0,
             armor_class: 0,
-            damage: Damage::default(),
+            damage: AttackRoutine::One(DamageRoll::default()),
+            attack_index: 0,
             saving_throws: SavingThrows::new(),
             status_effects: StatusEffects::new(),
             modifiers: StatModifiers::new(),
         }
     }
+
+    pub fn current_damage(&self) -> Option<DamageRoll> {
+        match self.damage {
+            AttackRoutine::One(d1) => {
+                match self.attack_index {
+                    0 => Some(d1),
+                    _ => None,
+                }
+            },
+            AttackRoutine::Two(d1, d2) => {
+                match self.attack_index {
+                    0 => Some(d1),
+                    1 => Some(d2),
+                    _ => None,
+                }
+            },
+            AttackRoutine::Three(d1, d2, d3) => {
+                match self.attack_index {
+                    0 => Some(d1),
+                    1 => Some(d2),
+                    2 => Some(d3),
+                    _ => None,
+                }
+            },
+        }
+    }
+
+    pub fn saving_throw(&self, save: SavingThrowType) -> bool {
+        let modifier = match save {
+            SavingThrowType::PetrificationParalysis => {
+                self.saving_throws.petrification_paralysis + self.modifiers.save_petrification_paralysis.total()
+            },
+            SavingThrowType::PoisonDeath => {
+                self.saving_throws.poison_death + self.modifiers.save_poison_death.total()
+            },
+            SavingThrowType::BlastBreath => {
+                self.saving_throws.blast_breath + self.modifiers.save_blast_breath.total()
+            },
+            SavingThrowType::StaffsWands => {
+                self.saving_throws.staffs_wands + self.modifiers.save_staffs_wands.total()
+            },
+            SavingThrowType::Spells => {
+                self.saving_throws.spells + self.modifiers.save_spells.total()
+            },
+        };
+        let nat = DiceRoll::simple(1, 20).roll();
+        nat >= 20 || nat + modifier >= 20
+    }
+}
+
+#[simple_enum(display)]
+pub enum SavingThrowType {
+    /// Petrification & Paralysis
+    PetrificationParalysis,
+    /// Poison & Death
+    PoisonDeath,
+    /// Blast & Breath
+    BlastBreath,
+    /// Staffs & Wands
+    StaffsWands,
+    /// Spells
+    Spells,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,21 +169,74 @@ pub enum StatusEffect {
     Concentrating,
 }
 
+#[simple_enum(display)]
+pub enum AttackType {
+    /// Melee
+    Melee,
+    /// Missile
+    Missile,
+}
+
 /// Represents the base damage roll for something.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-pub struct Damage {
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DamageRoll {
     pub amount: u32,
     pub sides: u32,
     pub modifier: i32,
+    pub attack_type: AttackType,
 }
 
-impl Damage {
+impl DamageRoll {
+    pub fn new(amount: u32, sides: u32, modifier: i32, attack_type: AttackType) -> Self {
+        Self {
+            amount,
+            sides,
+            modifier,
+            attack_type,
+        }
+    }
+
     pub fn default() -> Self {
         Self {
             amount: 1,
             sides: 2,
             modifier: 0,
+            attack_type: AttackType::Melee,
         }
+    }
+
+    pub fn melee() -> Self {
+        Self {
+            amount: 1,
+            sides: 2,
+            modifier: 0,
+            attack_type: AttackType::Melee,
+        } 
+    }
+
+    pub fn missile() -> Self {
+        Self {
+            amount: 1,
+            sides: 2,
+            modifier: 0,
+            attack_type: AttackType::Missile,
+        } 
+    }
+
+    pub fn as_diceroll(&self) -> DiceRoll {
+        DiceRoll::simple_modifier(self.amount, self.sides, self.modifier)
+    }
+
+    pub fn to_notation(&self) -> String {
+        if self.modifier == 0 {
+            format!("{}d{}", self.amount, self.sides)
+        } else {
+            format!("{}d{}{:+}", self.amount, self.sides, self.modifier)
+        }
+    }
+
+    pub fn roll(&self) -> i32 {
+        self.as_diceroll().roll()
     }
 }
 
@@ -130,7 +251,7 @@ pub struct StatModifiers {
     pub initiative: StatMod<i32>,
     pub surprise: StatMod<i32>,
     pub armor_class: StatMod<i32>,
-    pub xp_gain: StatMod<f32>,
+    pub xp_gain: StatMod<f64>,
     pub save_petrification_paralysis: StatMod<i32>,
     pub save_poison_death: StatMod<i32>,
     pub save_blast_breath: StatMod<i32>,
@@ -155,6 +276,22 @@ impl StatModifiers {
             save_staffs_wands: StatMod::new(0),
             save_spells: StatMod::new(0),
         }
+    }
+
+    pub fn add_all_saves(&mut self, key: impl Into<String> + Clone, value: i32) {
+        self.save_petrification_paralysis.add(key.clone(), value);
+        self.save_poison_death.add(key.clone(), value);
+        self.save_blast_breath.add(key.clone(), value);
+        self.save_staffs_wands.add(key.clone(), value);
+        self.save_spells.add(key, value);
+    }
+
+    pub fn remove_all_saves(&mut self, key: impl Into<String> + Clone) {
+        self.save_petrification_paralysis.remove(key.clone());
+        self.save_poison_death.remove(key.clone());
+        self.save_blast_breath.remove(key.clone());
+        self.save_staffs_wands.remove(key.clone());
+        self.save_spells.remove(key);
     }
 }
 
@@ -274,7 +411,9 @@ impl Fight {
                 self.current_turn += 1;
                 return;
             }
-            data.log_public(format!("It is {}'s turn!", ctype.name()));
+            if data.get_combatant_stats_alt(ctype, |s| s.attack_index).unwrap_or(0) == 0 {
+                data.log_public(format!("It is {}'s turn!", ctype.name()));
+            }
             let mut list = vec![];
             for (_, comb) in &self.combatants {
                 if comb.id() == ctype.id() {
@@ -360,6 +499,24 @@ impl Fight {
                         }
                     },
                 }
+                if data.get_combatant_stats(&current_actor, |stats| {
+                    if let Some(stats) = stats {
+                        stats.attack_index += 1;
+                        if stats.current_damage().is_none() {
+                            stats.attack_index = 0;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                }) {
+                    self.current_turn += 1;
+                    self.awaiting_response = None;
+                } else {
+                    self.next_turn(data);
+                }
                 data.update_combatant(target);
                 data.update_combatant(&current_actor);
             },
@@ -368,28 +525,45 @@ impl Fight {
                 return;
             },
         }
-        self.current_turn += 1;
-        self.awaiting_response = None;
     }
 }
 
 pub fn damage_roll(data: &mut DMAppData, attacker: &CombatantType, critical: bool) -> i32 {
     data.get_combatant_stats_alt(attacker, |stats| {
-        let mut nat = dice::roll(DiceRoll::simple(stats.damage.amount, stats.damage.sides));
+        let damage = stats.current_damage().unwrap_or(DamageRoll::default());
+        let mut nat = damage.roll();
         if critical {
             nat *= 2;
         }
-        match nat as i32 + stats.modifiers.melee_damage.total() {
-            i if i < 1 => 1,
-            i => i,
+        match damage.attack_type {
+            AttackType::Melee => {
+                match nat + stats.modifiers.melee_damage.total() {
+                    i if i < 1 => 1,
+                    i => i,
+                }
+            },
+            AttackType::Missile => {
+                match nat + stats.modifiers.missile_damage.total() {
+                    i if i < 1 => 1,
+                    i => i,
+                }
+            },
         }
     }).unwrap_or(1)
 }
 
 pub fn attack_roll(data: &mut DMAppData, attacker: &CombatantType, target: &CombatantType) -> AttackResult {
-    let attack_throw = data.get_combatant_stats_alt(attacker, |s| s.attack_throw + s.modifiers.melee_attack.total()).unwrap_or(10);
+    let attack_throw = data.get_combatant_stats_alt(attacker, |s| {
+        match s.current_damage().unwrap_or(DamageRoll::default()).attack_type {
+            AttackType::Melee => {
+                s.attack_throw + s.modifiers.melee_attack.total()
+            },
+            AttackType::Missile => {
+                s.attack_throw + s.modifiers.missile_attack.total()
+            },
+        }
+    }).unwrap_or(10);
     let armor_class = data.get_combatant_stats_alt(target, |s| s.armor_class + s.modifiers.armor_class.total()).unwrap_or(0);
-
     let r = d20_exploding();
     if r <= 1 {
         return AttackResult::CriticalFail;

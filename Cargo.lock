@@ -647,6 +647,7 @@ dependencies = [
  "chrono",
  "displaydoc",
  "eframe",
+ "lazy_static",
  "local-ip-address",
  "rand",
  "ron",

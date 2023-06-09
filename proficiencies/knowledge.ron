@@ -1,0 +1,1 @@
+(name:"Knowledge",description:"Here in my garage",is_general:true,max_level:2,requires_specification:true,valid_specifications:None,starting_throw:Some(9))

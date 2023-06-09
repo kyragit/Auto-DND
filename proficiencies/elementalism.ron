@@ -1,0 +1,14 @@
+(
+    name: "Elementalism",
+    description: "Are you the avatar, Aang?",
+    is_general: false,
+    max_level: 0,
+    requires_specification: true,
+    valid_specifications: Some([
+        "Water",
+        "Earth",
+        "Fire",
+        "Air",
+    ]),
+    starting_throw: None,
+)

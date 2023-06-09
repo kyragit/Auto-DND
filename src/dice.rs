@@ -1,8 +1,6 @@
 use rand::prelude::*;
 use serde::{Serialize, Deserialize};
 
-use crate::common_ui::display_i32;
-
 /// Represents a roll of one or more dice.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct DiceRoll {
@@ -37,7 +35,7 @@ impl DiceRoll {
 
     pub fn to_notation(&self) -> String {
         format!("{}d{}{}", self.amount, self.sides, match self.modifier_type {
-            ModifierType::Add => display_i32(self.modifier),
+            ModifierType::Add => format!("{:+}", self.modifier),
             ModifierType::DivideCeil |
             ModifierType::DivideFloor |
             ModifierType::DivideRound => format!("÷{}", self.modifier),
@@ -45,11 +43,27 @@ impl DiceRoll {
         })
     }
 
+    pub fn roll(&self) -> i32 {
+        roll(*self)
+    }
+
     pub fn simple(amount: u32, sides: u32) -> Self {
         Self {
             amount,
             sides,
             modifier: 0,
+            modifier_type: ModifierType::Add,
+            apply_modifier_to_all: false,
+            drop: Drop::None,
+            min_value: 1,
+        }
+    }
+
+    pub fn simple_modifier(amount: u32, sides: u32, modifier: i32) -> Self {
+        Self {
+            amount,
+            sides,
+            modifier,
             modifier_type: ModifierType::Add,
             apply_modifier_to_all: false,
             drop: Drop::None,
@@ -121,7 +135,7 @@ impl Drop {
 }
 
 /// Rolls a `DiceRoll` and returns the result.
-pub fn roll(roll: DiceRoll) -> u32 {
+pub fn roll(roll: DiceRoll) -> i32 {
     if roll.amount == 0 || roll.sides == 0 {
         return 0;
     }
@@ -163,7 +177,7 @@ pub fn roll(roll: DiceRoll) -> u32 {
     if result < roll.min_value {
         result = roll.min_value;
     }
-    result as u32
+    result
 }
 
 fn apply_modifier(initial: i32, modifier: i32, modifier_type: ModifierType) -> i32 {

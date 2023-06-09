@@ -1,0 +1,1 @@
+(name:"Zombie",description:"scary undead",hit_dice:Standard(2),base_armor_class:0,base_attack_throw:11,base_damage:One((amount:1,sides:6,modifier:0,attack_type:Melee)),xp:50,morale:6,categories:[Undead,Construct],alignment:Chaotic,saves:(petrification_paralysis:5,poison_death:6,blast_breath:4,staffs_wands:4,spells:3))

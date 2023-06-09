@@ -1,0 +1,1 @@
+(name:"Fighting Style",description:"Fighting in tha style, you know?",is_general:false,max_level:0,requires_specification:true,valid_specifications:Some(["Two Weapons","Single Weapon","Two-handed Weapon","Weapon and Shield","Pole Weapon","Missile Weapon"]),starting_throw:None)

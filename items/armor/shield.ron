@@ -1,0 +1,1 @@
+(name:"Shield",description:"A standard shield.",value:(100.0),encumbrance:OneStone,tags:[],weapon_stats:None,armor_stats:None,shield_stats:Some(1),container_stats:None)

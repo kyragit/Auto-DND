@@ -1,0 +1,1 @@
+(name:"Helmet",description:"quantum pot of boiling stew",value:(100.0),encumbrance:OneSixth,tags:["steel","metal"],weapon_stats:None,armor_stats:Some(2),shield_stats:None,container_stats:None)

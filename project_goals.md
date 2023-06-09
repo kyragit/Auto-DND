@@ -2,12 +2,12 @@
 
 ## Features
 
-- Dice roller
-- Store and edit character sheets
-- Character generator
-    - Generates 5 blank characters, player must pick 2
+- ~~Dice roller~~
+- ~~Store and edit character sheets~~
+- ~~Character generator~~
+    - ~~Generates 5 blank characters, player must pick 2~~
 - Combat simulation (no map)
-    - Automatically updates character sheets
+    - ~~Automatically updates character sheets~~
     - Calculates XP gain
     - Auto morale rolls
     - Mortal wounds
@@ -17,9 +17,9 @@
 - Auto reaction rolls
 - Inventory management
 - Auto level up
-- Sync server/client without jank
+- ~~Sync server/client without jank~~
 - Proficiency viewer
-- Enemy viewer (for the dm)
+- ~~Enemy viewer (for the dm)~~
 - Spell viewer
 - Treasure generator
 - Encounter generator
@@ -50,3 +50,10 @@
 - UI:
     - Don't make the UI a nightmare. Different panels should do different things, and it should be
     clear where a particular button is without having to check.
+
+
+## TODO
+
+- a more modular way of doing class bonuses. maybe defining stat modifiers for every level?
+- Working proficiencies
+    - Find a way to handle generic proficiencies (e.g. Performance(Dance))

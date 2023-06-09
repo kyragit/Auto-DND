@@ -1,23 +1,14 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
 
-use crate::{combat::{CombatantStats, Combatant, Damage}, dice::{DiceRoll, self, ModifierType, Drop}, character::{SavingThrows, Attributes}, common_ui::display_i32};
+use crate::{combat::{CombatantStats, DamageRoll}, dice::{DiceRoll, self, ModifierType, Drop}, character::{SavingThrows, Attributes}};
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Enemy {
     pub combat_stats: CombatantStats,
-}
-
-impl<'s> Combatant<'s> for Enemy {
-    fn get_combat_stats(&'s self) -> &'s CombatantStats {
-        &self.combat_stats
-    }
-    fn get_combat_stats_mut(&'s mut self) -> &'s mut CombatantStats {
-        &mut self.combat_stats
-    }
 }
 
 impl Enemy {
@@ -38,12 +29,12 @@ impl Enemy {
                 dice::roll(roll)
             },
         };
-        s.combat_stats.health.max_hp = hp;
-        s.combat_stats.health.current_hp = hp as i32;
+        s.combat_stats.health.max_hp = hp as u32;
+        s.combat_stats.health.current_hp = hp;
         s.combat_stats.armor_class = typ.base_armor_class;
         s.combat_stats.attack_throw = typ.base_attack_throw;
         s.combat_stats.saving_throws = typ.saves;
-        s.combat_stats.damage = Damage { amount: 1, sides: 6, modifier: -1 };
+        s.combat_stats.damage = typ.base_damage;
         s
     }
 }
@@ -66,20 +57,18 @@ pub struct EnemyType {
 impl EnemyType {
     pub fn save(&self, file: &str) -> Result<(), ()> {
         if let Ok(s) = ron::to_string(self) {
-            if let Ok(_) = std::fs::write(format!("enemies/{}.ron", file), s.as_bytes()) {
+            let file = format!("enemies/{}.ron", file);
+            let path = Path::new(&file);
+            if let Some(parent) = path.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    return Err(());
+                }
+            }
+            if let Ok(_) = std::fs::write(path, s.as_bytes()) {
                 return Ok(());
             }
         }
         Err(())
-    }
-
-    pub fn load(file: &str) -> Option<Self> {
-        if let Ok(s) = std::fs::read_to_string(format!("enemies/{}.ron", file)) {
-            if let Ok(enemy) = ron::from_str::<EnemyType>(&s) {
-                return Some(enemy);
-            }
-        }
-        None
     }
 
     pub fn default() -> Self {
@@ -89,7 +78,7 @@ impl EnemyType {
             hit_dice: EnemyHitDice::Standard(1),
             base_armor_class: 0,
             base_attack_throw: 10,
-            base_damage: AttackRoutine::One(DiceRoll::simple(1, 4)),
+            base_damage: AttackRoutine::One(DamageRoll::default()),
             xp: 0,
             morale: 0,
             categories: HashSet::new(),
@@ -156,7 +145,7 @@ impl EnemyHitDice {
     pub fn display(&self) -> String {
         match self {
             Self::Standard(n) => format!("{}", n),
-            Self::WithModifier(n, m) => format!("{}{}", n, display_i32(*m)),
+            Self::WithModifier(n, m) => format!("{}{:+}", n, m),
             Self::Special(roll) => roll.to_notation(),
         }
     }
@@ -164,9 +153,9 @@ impl EnemyHitDice {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AttackRoutine {
-    One(DiceRoll),
-    Two(DiceRoll, DiceRoll),
-    Three(DiceRoll, DiceRoll, DiceRoll),
+    One(DamageRoll),
+    Two(DamageRoll, DamageRoll),
+    Three(DamageRoll, DamageRoll, DamageRoll),
 }
 
 impl std::fmt::Display for AttackRoutine {

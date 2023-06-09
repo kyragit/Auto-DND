@@ -1,0 +1,9 @@
+(
+    name: "Divine Blessing",
+    description: "+2 to all saves.",
+    is_general: false,
+    max_level: 0,
+    requires_specification: false,
+    valid_specifications: None,
+    starting_throw: None,
+)

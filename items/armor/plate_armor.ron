@@ -1,0 +1,1 @@
+(name:"Plate Armor",description:"Thick steel plate armor.",value:(600.0),encumbrance:VeryHeavy(6),tags:[],weapon_stats:None,armor_stats:Some(6),shield_stats:None,container_stats:None)

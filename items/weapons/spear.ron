@@ -1,0 +1,1 @@
+(name:"Spear",description:"A sharp pokey stick.",value:(100.0),encumbrance:OneHalf,tags:[],weapon_stats:Some((damage:Melee(Versatile((amount:1,sides:6,modifier:0,attack_type:Melee),(amount:1,sides:8,modifier:0,attack_type:Melee))))),armor_stats:None,shield_stats:None,container_stats:None)

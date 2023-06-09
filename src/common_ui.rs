@@ -1,4 +1,4 @@
-use crate::{dm_app::DMAppData, player_app::PlayerAppData, dice::{DiceRoll, ModifierType, Drop}};
+use crate::{dm_app::DMAppData, player_app::PlayerAppData, dice::{DiceRoll, ModifierType, Drop}, combat::DamageRoll};
 use eframe::egui::{self, WidgetText, InnerResponse, Ui, RichText};
 
 pub trait CommonApp<'d> {
@@ -111,6 +111,7 @@ pub enum CharacterSheetTab {
     Stats,
     Class,
     Inventory,
+    Proficiencies,
     Spells,
     Notes,
 }
@@ -121,6 +122,7 @@ impl TabValue for CharacterSheetTab {
             Self::Stats,
             Self::Class,
             Self::Inventory,
+            Self::Proficiencies,
             Self::Spells,
             Self::Notes,
         ]
@@ -130,25 +132,10 @@ impl TabValue for CharacterSheetTab {
             Self::Stats => "Stats",
             Self::Class => "Class",
             Self::Inventory => "Inventory",
+            Self::Proficiencies => "Proficiencies",
             Self::Spells => "Spells",
             Self::Notes => "Notes",
         }.to_owned()
-    }
-}
-
-pub fn display_i32(i: i32) -> String {
-    if i < 0 {
-        format!("{}", i)
-    } else {
-        format!("+{}", i)
-    }
-}
-
-pub fn display_percent(x: f32) -> String {
-    if x < 0.0 {
-        format!("{}%", x * 100.0)
-    } else {
-        format!("+{}%", x * 100.0)
     }
 }
 
@@ -198,6 +185,12 @@ pub fn dice_roll_editor(ui: &mut Ui, roll: &mut DiceRoll) {
 }
 
 pub fn dice_roll_editor_simple(ui: &mut Ui, roll: &mut DiceRoll) {
+    ui.add(egui::Slider::new(&mut roll.amount, 1..=10).text("Amount").clamp_to_range(false));
+    ui.add(egui::Slider::new(&mut roll.sides, 1..=20).text("Sides").clamp_to_range(false));
+    ui.add(egui::Slider::new(&mut roll.modifier, -10..=10).text("Modifier").clamp_to_range(false));
+}
+
+pub fn damage_roll_editor(ui: &mut Ui, roll: &mut DamageRoll) {
     ui.add(egui::Slider::new(&mut roll.amount, 1..=10).text("Amount").clamp_to_range(false));
     ui.add(egui::Slider::new(&mut roll.sides, 1..=20).text("Sides").clamp_to_range(false));
     ui.add(egui::Slider::new(&mut roll.modifier, -10..=10).text("Modifier").clamp_to_range(false));

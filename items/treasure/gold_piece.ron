@@ -1,0 +1,1 @@
+(name:"Gold Piece",description:"A gold coin.",value:(10.0),encumbrance:Treasure,tags:["gp"],weapon_stats:None,armor_stats:None,shield_stats:None,container_stats:None)

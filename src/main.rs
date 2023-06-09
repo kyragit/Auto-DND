@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use std::{rc::Rc, cell::RefCell};
 
 /// Simulated dice roller.
@@ -16,10 +18,16 @@ pub mod player_app;
 pub mod class;
 /// Character race information.
 pub mod race;
+/// Some shared UI and utility code.
 pub mod common_ui;
+/// Combat automation.
 pub mod combat;
+/// Monsters and the like.
 pub mod enemy;
+/// Items, weapons, etc.
 pub mod item;
+/// Proficiency logic.
+pub mod proficiency;
 
 fn main() -> Result<(), eframe::Error> {
     // have to do some fuckery with interior mutability to store the button press between applications

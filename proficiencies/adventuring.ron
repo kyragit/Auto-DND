@@ -1,0 +1,9 @@
+(
+    name: "Adventuring",
+    description: "You can actually play the game.",
+    is_general: true,
+    max_level: 0,
+    requires_specification: false,
+    valid_specifications: None,
+    starting_throw: None,
+)

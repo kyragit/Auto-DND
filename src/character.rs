@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
-use crate::{dice::{roll, DiceRoll, self}, class::{Class, SavingThrowProgressionType}, race::Race, combat::{CombatantStats, Combatant, Damage, StatModifiers, StatusEffects}, item::{Item, ItemType}};
+use crate::{dice::{roll, DiceRoll}, class::{Class, SavingThrowProgressionType, HitDie}, race::Race, combat::{CombatantStats, DamageRoll, StatModifiers, StatusEffects}, item::{Item, ItemType, Encumbrance}, enemy::AttackRoutine, proficiency::{Proficiencies, ProficiencyInstance, PROF_CODE_MAP}};
 use serde::{Deserialize, Serialize};
+use simple_enum_macro::simple_enum;
 
 /// All the data for a player character, aside from their name (this is for technical reasons and 
 /// may change in the future). Essentially, this is everything that would go on a character sheet.
@@ -10,10 +11,12 @@ pub struct PlayerCharacter {
     pub combat_stats: CombatantStats,
     pub race: Race,
     pub class: Class,
+    pub title: String,
     pub level: u8,
     pub xp: u32,
     pub xp_to_level: u32,
     pub inventory: PlayerInventory,
+    pub proficiencies: Proficiencies,
     pub notes: String,
 }
 
@@ -27,38 +30,30 @@ impl PlayerCharacter {
                 health: Health::new(), 
                 attack_throw: 10, 
                 armor_class: 0, 
-                damage: Damage::default(),
+                damage: AttackRoutine::One(DamageRoll::default()),
+                attack_index: 0,
                 saving_throws: SavingThrows::new(),
                 status_effects: StatusEffects::new(),
                 modifiers: StatModifiers::new(),
             },
             race,
-            xp_to_level: class.calculate_next_level_cost(1),
+            xp_to_level: 0,
             class,
+            title: String::new(),
             level: 1,
             xp: 0,
             inventory: PlayerInventory::empty(),
+            proficiencies: Proficiencies::new(),
             notes: String::new(),
         }
     }
 
     pub fn initialize(&mut self) {
-        let hp = dice::roll(DiceRoll::new(
-            1, 
-            match self.class.hit_die {
-                crate::class::HitDie::D4 => 4,
-                crate::class::HitDie::D6 => 6,
-                crate::class::HitDie::D8 => 8,
-                crate::class::HitDie::D10 => 10,
-                crate::class::HitDie::D12 => 12,
-            }, 
-            self.combat_stats.attributes.modifier(Attr::CON), 
-            dice::ModifierType::Add, false, dice::Drop::None, 1)
-        );
+        let hp = self.roll_hit_die();
+        self.xp_to_level = self.class.calculate_next_level_cost(1);
         self.combat_stats.health.max_hp = hp;
         self.combat_stats.health.current_hp = hp as i32;
         self.combat_stats.saving_throws = SavingThrows::calculate_simple(self.class.saving_throw_progression_type, self.level);
-        self.combat_stats.damage = Damage { amount: 1, sides: 6, modifier: 0 };
         self.combat_stats.modifiers.melee_attack.add("strength", self.combat_stats.attributes.modifier(Attr::STR));
         self.combat_stats.modifiers.melee_damage.add("strength", self.combat_stats.attributes.modifier(Attr::STR));
         self.combat_stats.modifiers.missile_attack.add("dexterity", self.combat_stats.attributes.modifier(Attr::DEX));
@@ -70,20 +65,61 @@ impl PlayerCharacter {
         self.combat_stats.modifiers.save_staffs_wands.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
         self.combat_stats.modifiers.save_spells.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
         let xp_gain = self.class.prime_reqs.iter().map(|attr| self.combat_stats.attributes.modifier(*attr)).min();
-        self.combat_stats.modifiers.xp_gain.add("prime_reqs", xp_gain.unwrap_or(0) as f32 * 0.05);
-
-        self.inventory.add(Item { item_type: ItemType::gold(), count: 100 });
-        self.inventory.add(Item { item_type: ItemType::silver(), count: 250 });
-        self.inventory.add(Item { item_type: ItemType::copper(), count: 325 });
+        self.combat_stats.modifiers.xp_gain.add("prime_reqs", xp_gain.unwrap_or(0) as f64 * 0.05);
+        self.title = self.class.titles.get(1);
+        self.proficiencies.class_slots = 1;
+        self.proficiencies.general_slots = 1;
+        if self.combat_stats.attributes.modifier(Attr::INT) > 0 {
+            self.proficiencies.general_slots += self.combat_stats.attributes.modifier(Attr::INT) as u8;
+        }
     }
-}
 
-impl<'s> Combatant<'s> for PlayerCharacter {
-    fn get_combat_stats(&'s self) -> &'s CombatantStats {
-        &self.combat_stats
+    pub fn roll_hit_die(&self) -> u32 {
+        if self.level > 9 {
+            match self.class.saving_throw_progression_type {
+                SavingThrowProgressionType::Cleric |
+                SavingThrowProgressionType::Mage => 1,
+                SavingThrowProgressionType::Fighter |
+                SavingThrowProgressionType::Thief => 2,
+            }
+        } else {
+            DiceRoll::simple_modifier(
+                1, 
+                match self.class.hit_die {
+                    HitDie::D4 => 4,
+                    HitDie::D6 => 6,
+                    HitDie::D8 => 8,
+                    HitDie::D10 => 10,
+                    HitDie::D12 => 12,
+                }, 
+                self.combat_stats.attributes.modifier(Attr::CON),
+            ).roll() as u32
+        }
     }
-    fn get_combat_stats_mut(&'s mut self) -> &'s mut CombatantStats {
-        &mut self.combat_stats
+
+    pub fn level_up(&mut self) {
+        if self.level >= self.class.maximum_level {
+            return;
+        }
+        self.level += 1;
+        let hp = self.roll_hit_die();
+        self.combat_stats.health.max_hp += hp;
+        self.combat_stats.health.current_hp = self.combat_stats.health.max_hp as i32;
+        self.combat_stats.saving_throws = SavingThrows::calculate_simple(self.class.saving_throw_progression_type, self.level);
+        self.combat_stats.attack_throw = self.class.attack_throw_progression.calculate(self.level);
+        self.xp_to_level = self.class.calculate_next_level_cost(self.level);
+        self.title = self.class.titles.get(self.level);
+    }
+
+    pub fn add_prof(&mut self, id: &str, prof: ProficiencyInstance) {
+        PROF_CODE_MAP.trigger_add(id, self, &prof);
+        self.proficiencies.profs.insert((id.to_owned(), prof.specification.clone()), prof);
+    }
+
+    pub fn remove_prof(&mut self, id: &(String, Option<String>)) {
+        if let Some(prof) = self.proficiencies.profs.remove(id) {
+            PROF_CODE_MAP.trigger_remove(&id.0, self, &prof);
+        }
     }
 }
 
@@ -132,13 +168,19 @@ impl Attributes {
     }
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[simple_enum(display)]
 pub enum Attr {
+    /// STR
     STR,
+    /// DEX
     DEX,
+    /// CON
     CON,
+    /// INT
     INT,
+    /// WIS
     WIS,
+    /// CHA
     CHA,
 }
 
@@ -243,15 +285,15 @@ impl SavingThrows {
 pub struct PlayerInventory {
     total_weight: f64,
     items: Vec<Item>,
-    left_hand: i32,
-    right_hand: i32,
-    armor: i32,
-    clothes: HashSet<u32>,
-    cp: i32,
-    sp: i32,
-    ep: i32,
-    gp: i32,
-    pp: i32,
+    pub left_hand: Option<usize>,
+    pub right_hand: Option<usize>,
+    pub armor: Option<usize>,
+    pub clothes: HashSet<usize>,
+    cp: Option<usize>,
+    sp: Option<usize>,
+    ep: Option<usize>,
+    gp: Option<usize>,
+    pp: Option<usize>,
 }
 
 impl PlayerInventory {
@@ -259,15 +301,36 @@ impl PlayerInventory {
         Self {
             total_weight: 0.0,
             items: Vec::new(),
-            left_hand: -1,
-            right_hand: -1,
-            armor: -1,
+            left_hand: None,
+            right_hand: None,
+            armor: None,
             clothes: HashSet::new(),
-            cp: -1,
-            sp: -1,
-            ep: -1,
-            gp: -1,
-            pp: -1,
+            cp: None,
+            sp: None,
+            ep: None,
+            gp: None,
+            pp: None,
+        }
+    }
+
+    pub fn get_equip_slot(&self, slot: PlayerEquipSlot) -> Option<&Item> {
+        match slot {
+            PlayerEquipSlot::LeftHand => self.left_hand,
+            PlayerEquipSlot::RightHand | PlayerEquipSlot::BothHands => self.right_hand,
+            PlayerEquipSlot::Armor => self.armor,
+            PlayerEquipSlot::CP => self.cp,
+            PlayerEquipSlot::SP => self.sp,
+            PlayerEquipSlot::EP => self.ep,
+            PlayerEquipSlot::GP => self.gp,
+            PlayerEquipSlot::PP => self.pp,
+        }.map_or(None, |i| self.items.get(i))
+    }
+
+    pub fn foreach_clothes<F: FnMut(&Item)>(&self, mut func: F) {
+        for &i in &self.clothes {
+            if let Some(item) = self.items.get(i as usize) {
+                func(item);
+            }
         }
     }
 
@@ -281,14 +344,98 @@ impl PlayerInventory {
         }
     }
 
+    pub fn foreach_enumerate<F: FnMut(usize, &Item)>(&self, mut func: F) {
+        let mut i = 0usize;
+        for item in &self.items {
+            func(i, item);
+            i += 1;
+        }
+    }
+
     pub fn add(&mut self, item: Item) {
+        if item.item_type.tags.contains("pp") {
+            self.add_currency(Currency::PP, item.count);
+            return;
+        }
+        if item.item_type.tags.contains("gp") {
+            self.add_currency(Currency::GP, item.count);
+            return;
+        }
+        if item.item_type.tags.contains("ep") {
+            self.add_currency(Currency::EP, item.count);
+            return;
+        }
+        if item.item_type.tags.contains("sp") {
+            self.add_currency(Currency::SP, item.count);
+            return;
+        }
+        if item.item_type.tags.contains("cp") {
+            self.add_currency(Currency::CP, item.count);
+            return;
+        }
         self.total_weight += item.item_type.encumbrance.as_float() * item.count as f64;
         self.items.push(item);
     }
 
-    pub fn remove(&mut self, index: u32) -> Option<Item> {
-        if index < self.items.len() as u32 {
-            let item = self.items.remove(index as usize);
+    fn add_currency(&mut self, currency: Currency, amount: u32) {
+        self.total_weight += Encumbrance::Treasure.as_float() * amount as f64;
+        match currency {
+            Currency::CP => {
+                if let Some(i) = self.cp {
+                    if let Some(item) = self.items.get_mut(i) {
+                        item.count += amount;
+                        return;
+                    }
+                }
+                self.cp = Some(self.items.len());
+                self.items.push(Item { item_type: ItemType::copper(), count: amount });
+            },
+            Currency::SP => {
+                if let Some(i) = self.sp {
+                    if let Some(item) = self.items.get_mut(i) {
+                        item.count += amount;
+                        return;
+                    }
+                }
+                self.sp = Some(self.items.len());
+                self.items.push(Item { item_type: ItemType::silver(), count: amount });
+            },
+            Currency::EP => {
+                if let Some(i) = self.ep {
+                    if let Some(item) = self.items.get_mut(i) {
+                        item.count += amount;
+                        return;
+                    }
+                }
+                self.ep = Some(self.items.len());
+                self.items.push(Item { item_type: ItemType::electrum(), count: amount });
+            },
+            Currency::GP => {
+                if let Some(i) = self.gp {
+                    if let Some(item) = self.items.get_mut(i) {
+                        item.count += amount;
+                        return;
+                    }
+                }
+                self.gp = Some(self.items.len());
+                self.items.push(Item { item_type: ItemType::gold(), count: amount });
+            },
+            Currency::PP => {
+                if let Some(i) = self.pp {
+                    if let Some(item) = self.items.get_mut(i) {
+                        item.count += amount;
+                        return;
+                    }
+                }
+                self.pp = Some(self.items.len());
+                self.items.push(Item { item_type: ItemType::platinum(), count: amount });
+            },
+        }
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<Item> {
+        if index < self.items.len() {
+            let item = self.items.remove(index);
             self.total_weight -= item.item_type.encumbrance.as_float() * item.count as f64;
             self.fix_indexes(index);
             return Some(item);
@@ -296,13 +443,14 @@ impl PlayerInventory {
         None
     }
 
-    fn fix_indexes(&mut self, index: u32) {
-        let i = index as i32;
-        let fix = |n: &mut i32| {
-            if i < *n {
-                *n -= 1;
-            } else if i == *n {
-                *n = -1;
+    fn fix_indexes(&mut self, index: usize) {
+        let fix = |maybe_n: &mut Option<usize>| {
+            if let Some(n) = maybe_n {
+                if index < *n {
+                    *n -= 1;
+                } else if index == *n {
+                    *maybe_n = None;
+                }
             }
         };
         fix(&mut self.left_hand);
@@ -314,12 +462,153 @@ impl PlayerInventory {
         fix(&mut self.gp);
         fix(&mut self.pp);
 
-        self.clothes.retain(|n| *n as i32 != i);
+        self.clothes.retain(|n| *n != index);
         self.clothes = self.clothes.drain().map(|mut n| {
-            if (n as i32) < i {
+            if n < index {
                 n -= 1;
             }
             n
         }).collect();
     }
+
+    pub fn move_up(&mut self, index: usize) {
+        if index == 0 {
+            return;
+        }
+        if index < self.items.len() {
+            self.items.swap(index, index - 1);
+            self.swap_indexes(index, index - 1);
+        }
+    }
+
+    pub fn move_down(&mut self, index: usize) {
+        if index < self.items.len() - 1 {
+            self.items.swap(index, index + 1);
+            self.swap_indexes(index, index + 1);
+        }
+    }
+
+    fn swap_indexes(&mut self, n: usize, m: usize) {
+        let fix = |i: &mut Option<usize>| {
+            if let Some(i) = i {
+                if *i == n {
+                    *i = m;
+                    return;
+                }
+                if *i == m {
+                    *i = n;
+                    return;
+                }
+            }
+        };
+        fix(&mut self.left_hand);
+        fix(&mut self.right_hand);
+        fix(&mut self.armor);
+        fix(&mut self.cp);
+        fix(&mut self.sp);
+        fix(&mut self.ep);
+        fix(&mut self.gp);
+        fix(&mut self.pp);
+        let add_m = self.clothes.remove(&n);
+        let add_n = self.clothes.remove(&m);
+        if add_m {
+            self.clothes.insert(m);
+        }
+        if add_n {
+            self.clothes.insert(n);
+        }
+    }
+
+    pub fn equip(&mut self, slot: PlayerEquipSlot, index: usize) {
+        match slot {
+            PlayerEquipSlot::LeftHand => {
+                self.left_hand = Some(index);
+            },
+            PlayerEquipSlot::RightHand => {
+                self.right_hand = Some(index);
+            },
+            PlayerEquipSlot::BothHands => {
+                self.left_hand = Some(index);
+                self.right_hand = Some(index); 
+            },
+            PlayerEquipSlot::Armor => {
+                self.armor = Some(index);
+            },
+            _ => {},
+        }
+    }
+
+    pub fn unequip(&mut self, slot: PlayerEquipSlot) {
+        match slot {
+            PlayerEquipSlot::LeftHand => {
+                self.left_hand = None;
+            },
+            PlayerEquipSlot::RightHand => {
+                self.right_hand = None;
+            },
+            PlayerEquipSlot::BothHands => {
+                self.left_hand = None;
+                self.right_hand = None;
+            },
+            PlayerEquipSlot::Armor => {
+                self.armor = None;
+            },
+            _ => {},
+        }
+    }
+
+    pub fn is_equipped(&self, index: usize) -> Option<PlayerEquipSlot> {
+        let mut is_right = false;
+        let mut is_left = false;
+        if let Some(right) = self.right_hand {
+            if right == index {
+                is_right = true;
+            }
+        }
+        if let Some(left) = self.left_hand {
+            if left == index {
+                is_left = true;
+            }
+        }
+        if is_right && is_left {
+            Some(PlayerEquipSlot::BothHands)
+        } else if is_right {
+            Some(PlayerEquipSlot::RightHand)
+        } else if is_left {
+            Some(PlayerEquipSlot::LeftHand)
+        } else {
+            None
+        }
+    }
+}
+
+#[simple_enum(display)]
+pub enum PlayerEquipSlot {
+    /// Left Hand
+    LeftHand,
+    /// Right Hand
+    RightHand,
+    /// Both Hands
+    BothHands,
+    /// Armor
+    Armor,
+    /// CP
+    CP,
+    /// SP
+    SP,
+    /// EP
+    EP,
+    /// GP
+    GP,
+    /// PP
+    PP,
+}
+
+#[simple_enum]
+enum Currency {
+    CP,
+    SP,
+    EP,
+    GP,
+    PP,
 }

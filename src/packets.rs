@@ -1,11 +1,16 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use serde::{Serialize, Deserialize};
-use crate::character::PlayerCharacter;
+use simple_enum_macro::simple_enum;
+use crate::character::{PlayerCharacter, PlayerEquipSlot};
 use crate::class::Class;
-use crate::combat::CombatantType;
-use crate::dm_app::{DMAppData, UserData};
+use crate::combat::{CombatantType, DamageRoll, SavingThrowType};
+use crate::dm_app::{DMAppData, UserData, Registry};
+use crate::enemy::AttackRoutine;
+use crate::item::{WeaponDamage, MeleeDamage};
 use crate::player_app::PlayerAppData;
+use crate::proficiency::{Proficiency, ProficiencyInstance};
 
 /// A packet sent from the server to a client.
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,8 +26,12 @@ pub enum ClientBoundPacket {
     CreateNewCharacterResult(Result<(), ClientFacingError>, String),
     /// Sent when a client's character is updated for whatever reason.
     UpdateCharacter(String, PlayerCharacter),
+    /// Sent when the player recieves their personal notes from the server upon login.
     UpdatePlayerNotes(String),
+    /// Sent to notify a player that they must make a combat action.
     DecideCombatAction(CombatantType, Vec<CombatantType>),
+    UpdateClassRegistry(Registry<Class>),
+    UpdateProfRegistry(HashMap<String, Proficiency>),
 }
 
 impl ClientBoundPacket {
@@ -49,7 +58,7 @@ impl ClientBoundPacket {
                         }
                     }
                     data.picked_character = None;
-                    data.new_char_name.clear();
+                    data.new_char_name = None;
                     data.new_char_name_error = None;
                     data.send_to_server(ServerBoundPacket::RequestCharacterUpdate(name, None));
                 }
@@ -68,6 +77,16 @@ impl ClientBoundPacket {
                 data.combatant_list = combatants;
                 data.window_states.insert("combat_action".to_owned(), true);
             },
+            Self::UpdateClassRegistry(registry) => {
+                data.class_registry = registry;
+            },
+            Self::UpdateProfRegistry(profs) => {
+                for (id, prof) in  &profs {
+                    data.sorted_prof_list.push((id.clone(), prof.name.clone()));
+                }
+                data.sorted_prof_list.sort();
+                data.proficiency_registry = profs;
+            },
         }
     }
 }
@@ -85,8 +104,18 @@ pub enum ServerBoundPacket {
     CreateNewCharacter(String, PlayerCharacter),
     /// Sent to update a user's character sheet with data from the server.
     RequestCharacterUpdate(String, Option<PlayerCharacter>),
+    /// Sent when the player's personal notes change.
     UpdatePlayerNotes(String),
+    /// Sent when a player has decided on a combat action.
     DecideCombatAction(CombatAction),
+    /// Sent when a player tries to rearrange their inventory.
+    MoveInventoryItem(String, usize, bool),
+    /// Sent when a player tries to equip an item.
+    EquipInventoryItem(String, PlayerEquipSlot, usize),
+    /// Sent when a player tries to unequip an item.
+    UnequipInventoryItem(String, PlayerEquipSlot),
+    SavingThrow(String, SavingThrowType),
+    PickNewProficiency(String, bool, String, Option<String>),
 }
 
 impl ServerBoundPacket {
@@ -120,6 +149,8 @@ impl ServerBoundPacket {
                                 data.send_to_user_by_addr(ClientBoundPacket::UpdateCharacter(name, character), user);
                             }
                         }
+                        data.send_to_user_by_addr(ClientBoundPacket::UpdateClassRegistry(data.class_registry.clone()), user);
+                        data.send_to_user_by_addr(ClientBoundPacket::UpdateProfRegistry(data.proficiency_registry.clone()), user);
                         return;
                     }
                 }
@@ -149,12 +180,10 @@ impl ServerBoundPacket {
                             data.send_to_user(ClientBoundPacket::CreateNewCharacterResult(Err(ClientFacingError::CharacterNameTooLong), name), username);
                             return;
                         }
-                        if let Ok(s) = std::fs::read_to_string("classes/fighter.ron") {
-                            if let Ok(class) = ron::from_str::<Class>(&s) {
-                                character.class = class;
-                            }
-                        }
                         character.initialize();
+                        if let Some(prof) = data.proficiency_registry.get("adventuring") {
+                            character.add_prof("adventuring", ProficiencyInstance::from_prof(prof.clone()));
+                        }
                         user_data.characters.insert(name.clone(), character);
                         data.send_to_user(ClientBoundPacket::CreateNewCharacterResult(Ok(()), name), username);
                     }
@@ -187,6 +216,261 @@ impl ServerBoundPacket {
             Self::DecideCombatAction(action) => {
                 data.fight = data.fight.take().map(|mut f| {f.resolve_action(data, action); f});
             },
+            Self::MoveInventoryItem(name, index, up) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(user_data) = data.user_data.get_mut(&username) {
+                        if let Some(sheet) = user_data.characters.get_mut(&name) {
+                            if up {
+                                sheet.inventory.move_up(index);
+                            } else {
+                                sheet.inventory.move_down(index);
+                            }
+                            let sheet = sheet.clone();
+                            data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
+                        }
+                    }
+                }
+            },
+            Self::EquipInventoryItem(name, slot, index) => {
+                if slot == PlayerEquipSlot::LeftHand || slot == PlayerEquipSlot::BothHands {
+                    ServerBoundPacket::UnequipInventoryItem(name.clone(), PlayerEquipSlot::LeftHand).handle(data, user);
+                }
+                if slot == PlayerEquipSlot::RightHand || slot == PlayerEquipSlot::BothHands {
+                    ServerBoundPacket::UnequipInventoryItem(name.clone(), PlayerEquipSlot::RightHand).handle(data, user);
+                }
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(user_data) = data.user_data.get_mut(&username) {
+                        if let Some(sheet) = user_data.characters.get_mut(&name) {
+                            sheet.inventory.equip(slot, index);
+                            if let Some(item) = sheet.inventory.get_equip_slot(slot) {
+                                if let Some(armor) = item.item_type.armor_stats {
+                                    if slot == PlayerEquipSlot::Armor {
+                                        sheet.combat_stats.modifiers.armor_class.add("armor", armor as i32);
+                                    }
+                                }
+                                if let Some(shield) = item.item_type.shield_stats {
+                                    if slot == PlayerEquipSlot::LeftHand {
+                                        sheet.combat_stats.modifiers.armor_class.add("shield", shield as i32);
+                                    }
+                                }
+                                if let Some(weapon) = &item.item_type.weapon_stats {
+                                    match &weapon.damage {
+                                        WeaponDamage::Melee(melee) => {
+                                            match melee {
+                                                MeleeDamage::OneHanded(dmg) => {
+                                                    match slot {
+                                                        PlayerEquipSlot::LeftHand => {
+                                                            sheet.combat_stats.modifiers.melee_attack.add("dual_wielding", 1);
+                                                        },
+                                                        PlayerEquipSlot::RightHand => {
+                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg.clone());
+                                                        },
+                                                        _ => {},
+                                                    }
+                                                },
+                                                MeleeDamage::Versatile(dmg1, dmg2) => {
+                                                    match slot {
+                                                        PlayerEquipSlot::LeftHand => {
+                                                            sheet.combat_stats.modifiers.melee_attack.add("dual_wielding", 1);
+                                                        },
+                                                        PlayerEquipSlot::RightHand => {
+                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg1.clone());
+                                                        },
+                                                        PlayerEquipSlot::BothHands => {
+                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg2.clone());
+                                                        },
+                                                        _ => {},
+                                                    }
+                                                },
+                                                MeleeDamage::TwoHanded(dmg) => {
+                                                    match slot {
+                                                        PlayerEquipSlot::BothHands => {
+                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg.clone());
+                                                            sheet.combat_stats.modifiers.initiative.add("heavy_weapon", -1);
+                                                        },
+                                                        _ => {},
+                                                    }
+                                                },
+                                            }
+                                        },
+                                        WeaponDamage::Missile(dmg, _) => {
+                                            match slot {
+                                                PlayerEquipSlot::BothHands => {
+                                                    sheet.combat_stats.damage = AttackRoutine::One(dmg.clone());
+                                                },
+                                                _ => {},
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                            let sheet = sheet.clone();
+                            data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
+                        }
+                    }
+                }
+            },
+            Self::UnequipInventoryItem(name, mut slot) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(user_data) = data.user_data.get_mut(&username) {
+                        if let Some(sheet) = user_data.characters.get_mut(&name) {
+                            if slot == PlayerEquipSlot::LeftHand || slot == PlayerEquipSlot::RightHand {
+                                if let Some(left) = sheet.inventory.left_hand {
+                                    if let Some(right) = sheet.inventory.right_hand {
+                                        if left == right {
+                                            slot = PlayerEquipSlot::BothHands;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(item) = sheet.inventory.get_equip_slot(slot) {
+                                if let Some(_) = item.item_type.armor_stats {
+                                    if slot == PlayerEquipSlot::Armor {
+                                        sheet.combat_stats.modifiers.armor_class.remove("armor");
+                                    }
+                                }
+                                if let Some(_) = item.item_type.shield_stats {
+                                    if slot == PlayerEquipSlot::LeftHand {
+                                        sheet.combat_stats.modifiers.armor_class.remove("shield");
+                                    }
+                                }
+                                if let Some(weapon) = &item.item_type.weapon_stats {
+                                    match &weapon.damage {
+                                        WeaponDamage::Melee(melee) => {
+                                            match melee {
+                                                MeleeDamage::OneHanded(_) => {
+                                                    match slot {
+                                                        PlayerEquipSlot::LeftHand => {
+                                                            sheet.combat_stats.modifiers.melee_attack.remove("dual_wielding");
+                                                        },
+                                                        PlayerEquipSlot::RightHand => {
+                                                            sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                                        },
+                                                        _ => {},
+                                                    }
+                                                },
+                                                MeleeDamage::Versatile(_, _) => {
+                                                    match slot {
+                                                        PlayerEquipSlot::LeftHand => {
+                                                            sheet.combat_stats.modifiers.melee_attack.remove("dual_wielding");
+                                                        },
+                                                        PlayerEquipSlot::RightHand | PlayerEquipSlot::BothHands => {
+                                                            sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                                        },
+                                                        _ => {},
+                                                    }
+                                                },
+                                                MeleeDamage::TwoHanded(_) => {
+                                                    if slot == PlayerEquipSlot::BothHands {
+                                                        sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                                        sheet.combat_stats.modifiers.initiative.remove("heavy_weapon");
+                                                    }
+                                                },
+                                            }
+                                        },
+                                        WeaponDamage::Missile(_, _) => {
+                                            if slot == PlayerEquipSlot::BothHands {
+                                                sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                            }
+                                        },
+                                    }
+                                }
+                                sheet.inventory.unequip(slot);
+                                let sheet = sheet.clone();
+                                data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
+                            }
+                        }
+                    }
+                }
+            },
+            Self::SavingThrow(name, save) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(user_data) = data.user_data.get_mut(&username) {
+                        if let Some(sheet) = user_data.characters.get_mut(&name) {
+                            if sheet.combat_stats.saving_throw(save) {
+                                data.log_public(format!("{} successfully made a saving throw against {}!", name, save));
+                            } else {
+                                data.log_public(format!("{} failed a saving throw against {}!", name, save));
+                            }
+                        }
+                    }
+                }
+            },
+            Self::PickNewProficiency(name, general, id, spec) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(user_data) = data.user_data.get_mut(&username) {
+                        if let Some(sheet) = user_data.characters.get_mut(&name) {
+                            if let Some(prof) = data.proficiency_registry.get(&id) {
+                                if general && prof.is_general && sheet.proficiencies.general_slots > 0 {
+                                    if let Some(p) = sheet.proficiencies.profs.get(&(id.clone(), spec.clone())) {
+                                        if p.prof_level < prof.max_level {
+                                            let mut p = p.clone();
+                                            p.prof_level += 1;
+                                            sheet.remove_prof(&(id.clone(), spec));
+                                            sheet.add_prof(&id, p);
+                                            sheet.proficiencies.general_slots -= 1;
+                                        }
+                                    } else {
+                                        let mut p = ProficiencyInstance::from_prof(prof.clone());
+                                        if prof.requires_specification {
+                                            if let Some(valid) = &prof.valid_specifications {
+                                                if valid.contains(spec.as_ref().unwrap_or(&"@&%:".to_owned())) {
+                                                    p.specification = spec;
+                                                } else {
+                                                    return;
+                                                }
+                                            } else if spec.is_some() {
+                                                p.specification = spec;
+                                            } else {
+                                                return;
+                                            }
+                                        }
+                                        sheet.add_prof(&id, p);
+                                        sheet.proficiencies.general_slots -= 1;
+                                    }
+                                } else if !general && sheet.class.class_proficiencies.contains_key(&id) && sheet.proficiencies.class_slots > 0 {
+                                    if let Some(p) = sheet.proficiencies.profs.get(&(id.clone(), spec.clone())) {
+                                        if p.prof_level < prof.max_level {
+                                            let mut p = p.clone();
+                                            p.prof_level += 1;
+                                            sheet.remove_prof(&(id.clone(), spec.clone()));
+                                            sheet.add_prof(&id, p);
+                                            sheet.proficiencies.class_slots -= 1;
+                                        }
+                                    } else {
+                                        let mut p = ProficiencyInstance::from_prof(prof.clone());
+                                        if prof.requires_specification {
+                                            if let Some(valid) = &prof.valid_specifications {
+                                                if valid.contains(spec.as_ref().unwrap_or(&"@&%:".to_owned())) {
+                                                    if let Some(class_valid) = sheet.class.class_proficiencies.get(&id).unwrap() {
+                                                        if class_valid.contains(spec.as_ref().unwrap_or(&"@&%:".to_owned())) {
+                                                            p.specification = spec;
+                                                        } else {
+                                                            return;
+                                                        }
+                                                    } else {
+                                                        p.specification = spec;
+                                                    }
+                                                } else {
+                                                    return;
+                                                }
+                                            } else if spec.is_some() {
+                                                p.specification = spec;
+                                            } else {
+                                                return;
+                                            }
+                                        }
+                                        sheet.add_prof(&id, p);
+                                        sheet.proficiencies.class_slots -= 1;
+                                    }
+                                }
+                                let sheet = sheet.clone();
+                                data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
 }
@@ -197,7 +481,7 @@ pub enum CombatAction {
     RelinquishControl,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[simple_enum]
 pub enum ClientFacingError {
     UsernameTaken,
     UsernameTooLong,

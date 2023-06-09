@@ -1,1 +1,0 @@
-(name:"Goblin",description:"Green goblin man :3",hit_dice:Standard(1),base_armor_class:2,base_attack_throw:11,base_damage:One((amount:1,sides:4,modifier:0,modifier_type:Add,apply_modifier_to_all:false,drop:None,min_value:1)),xp:100,morale:0,categories:[Humanoid,Beastman],alignment:Chaotic,saves:(petrification_paralysis:4,poison_death:7,blast_breath:2,staffs_wands:1,spells:14))

@@ -1,0 +1,9 @@
+(
+    name: "Craft",
+    description: "She mine on my craft till I",
+    is_general: true,
+    max_level: 2,
+    requires_specification: true,
+    valid_specifications:None,
+    starting_throw: None,
+)
