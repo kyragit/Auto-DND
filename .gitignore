@@ -1,5 +1,11 @@
 /target
 *.code-workspace
 backups/
+classes/
+enemies/
+items/
+proficiencies/
+spells/
 simple_enum_macro/target/
 savedata.ron
+preferences.ron

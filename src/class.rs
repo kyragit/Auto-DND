@@ -1,15 +1,16 @@
-use std::collections::{HashSet, HashMap};
+use std::{collections::{HashSet, HashMap}};
 
-use crate::character::Attr;
+use crate::{character::Attr, race::Race};
 use displaydoc::Display;
 use serde::{Deserialize, Serialize};
 use simple_enum_macro::simple_enum;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Class {
+    pub race: Race,
     pub name: String,
     pub description: String,
-    pub prime_reqs: Vec<Attr>,
+    pub prime_reqs: HashSet<Attr>,
     pub maximum_level: u8,
     pub titles: Titles,
     pub hit_die: HitDie,
@@ -23,14 +24,17 @@ pub struct Class {
     pub class_damage_bonus: ClassDamageBonus,
     pub cleaves: Cleaves,
     pub thief_skills: ThiefSkills,
+    pub divine_value: DivineValue,
+    pub arcane_value: ArcaneValue,
 }
 
 impl Class {
     pub fn default() -> Self {
         Self {
+            race: Race::Human,
             name: String::new(),
             description: String::new(),
-            prime_reqs: vec![],
+            prime_reqs: HashSet::new(),
             maximum_level: 14,
             titles: Titles::new(),
             hit_die: HitDie::D4,
@@ -44,6 +48,8 @@ impl Class {
             class_damage_bonus: ClassDamageBonus::None,
             cleaves: Cleaves::None,
             thief_skills: ThiefSkills(HashSet::new()),
+            divine_value: DivineValue::None,
+            arcane_value: ArcaneValue::None,
         }
     }
     pub fn calculate_next_level_cost(&self, current_level: u8) -> u32 {
@@ -64,14 +70,6 @@ impl Class {
             8.. => self.calculate_next_level_cost(7) + (self.saving_throw_progression_type.get_max_xp_cost() * (current_level as u32 - 7)),
         }
     }
-    pub fn from_file(path: String) -> Option<Self> {
-        if let Ok(file) = std::fs::read_to_string(format!("classes/{}", path)) {
-            if let Ok(class) = ron::from_str::<Self>(&file) {
-                return Some(class);
-            }
-        }
-        None
-    }
 }
 
 #[simple_enum(display)]
@@ -88,23 +86,16 @@ pub enum HitDie {
     D12,
 }
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[simple_enum(display)]
 pub enum SavingThrowProgressionType {
+    /// Fighter
     Fighter,
+    /// Thief
     Thief,
+    /// Cleric
     Cleric,
+    /// Mage
     Mage,
-}
-
-impl std::fmt::Display for SavingThrowProgressionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", match self {
-            Self::Fighter => "Fighter",
-            Self::Thief => "Thief",
-            Self::Cleric => "Cleric",
-            Self::Mage => "Mage",
-        })
-    }
 }
 
 impl SavingThrowProgressionType {
@@ -117,12 +108,17 @@ impl SavingThrowProgressionType {
     }
 }
 
-#[simple_enum]
+#[simple_enum(display)]
 pub enum AttackThrowProgression {
+    /// Once per three levels
     OnePerThree,
+    /// Once per two levels
     OnePerTwo,
+    /// Twice per three levels
     TwoPerThree,
+    /// Once every level
     OnePerOne,
+    /// Three times every two levels
     ThreePerTwo,
 }
 
@@ -141,26 +137,33 @@ impl AttackThrowProgression {
     }
 }
 
-#[simple_enum]
+#[simple_enum(display)]
 pub enum Cleaves {
+    /// None
     None,
+    /// Half
     Half,
+    /// Full
     Full,
 }
 
-#[simple_enum]
+#[simple_enum(display)]
 pub enum ClassDamageBonus {
+    /// None
     None,
+    /// Only Melee
     MeleeOnly,
+    /// Only Missile
     MissileOnly,
+    /// Both
     Both,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct FightingStyles {
-    two_weapons: bool,
-    weapon_and_shield: bool,
-    two_handed: bool,
+    pub two_weapons: bool,
+    pub weapon_and_shield: bool,
+    pub two_handed: bool,
 }
 
 impl FightingStyles {
@@ -207,12 +210,17 @@ impl FightingStyles {
     }
 }
 
-#[simple_enum]
+#[simple_enum(display)]
 pub enum ArmorSelection {
+    /// Forbidden
     Forbidden,
+    /// Restricted (hide or less)
     Restricted,
+    /// Narrow (leather or less)
     Narrow,
+    /// Broad (chain or less)
     Broad,
+    /// Unrestricted
     Unrestricted,
 }
 
@@ -228,11 +236,15 @@ impl ArmorSelection {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Display)]
 pub enum WeaponSelection {
+    /// Restricted
     Restricted([RestrictedWeapons; 4]),
+    /// Narrow
     Narrow([NarrowWeapons; 2]),
+    /// Broad
     Broad([BroadWeapons; 2]),
+    /// Unrestricted
     Unrestricted,
 }
 
@@ -267,7 +279,22 @@ pub enum RestrictedWeapons {
     Whip,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Display)]
+impl RestrictedWeapons {
+    pub fn display(&self) -> String {
+        match self {
+            RestrictedWeapons::Club => "Clubs",
+            RestrictedWeapons::Dagger => "Daggers",
+            RestrictedWeapons::Bola => "Bolas",
+            RestrictedWeapons::Dart => "Darts",
+            RestrictedWeapons::Sling => "Slings",
+            RestrictedWeapons::Sap => "Saps",
+            RestrictedWeapons::Staff => "Staves",
+            RestrictedWeapons::Whip => "Whips",
+        }.to_owned()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Display)]
 pub enum NarrowWeapons {
     /// axes
     Axes,
@@ -285,7 +312,21 @@ pub enum NarrowWeapons {
     AnyThree(String, String, String),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Display)]
+impl NarrowWeapons {
+    pub fn display(&self) -> String {
+        match self {
+            NarrowWeapons::Axes => "Axes",
+            NarrowWeapons::BowsCrossbows => "Bows and Crossbows",
+            NarrowWeapons::FlailsHammersMaces => "Flails, Hammers, and Maces",
+            NarrowWeapons::SwordsDaggers => "Swords and Daggers",
+            NarrowWeapons::SpearsPolearms => "Spears and Polearms",
+            NarrowWeapons::Special => "Bolas, Darts, Nets, Slings, Saps, and Staves",
+            NarrowWeapons::AnyThree(_, _, _) => "Any Three Weapons",
+        }.to_owned()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Display)]
 pub enum BroadWeapons {
     /// one-handed weapons
     OneHanded,
@@ -301,8 +342,21 @@ pub enum BroadWeapons {
     AnyFive(String, String, String, String, String),
 }
 
+impl BroadWeapons {
+    pub fn display(&self) -> String {
+        match self {
+            Self::OneHanded => "Any One-Handed Weapon",
+            Self::TwoHanded => "Any Two-Handed Weapon",
+            Self::AxesFlailsHammersMaces => "Axes, Flails, Hammers, and Maces",
+            Self::SwordsDaggersSpearsPolearms => "Swords, Daggers, Spears, and Polearms",
+            Self::Missile => "Any Missile Weapon",
+            Self::AnyFive(_, _, _, _, _) => "Any Five Weapons",
+        }.to_owned()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Titles(Vec<String>);
+pub struct Titles(pub Vec<String>);
 
 impl Titles {
     pub fn new() -> Self {
@@ -359,4 +413,157 @@ pub enum ThiefSkill {
     ReadLanguages,
     /// Use Scrolls
     UseScrolls,
+}
+
+pub const THIEF_SKILLS: [ThiefSkill; 11] = [
+    ThiefSkill::OpenLocks,
+    ThiefSkill::FindTraps,
+    ThiefSkill::RemoveTraps,
+    ThiefSkill::PickPockets,
+    ThiefSkill::MoveSilently,
+    ThiefSkill::ClimbWalls,
+    ThiefSkill::HideInShadows,
+    ThiefSkill::HearNoise,
+    ThiefSkill::Backstab,
+    ThiefSkill::ReadLanguages,
+    ThiefSkill::UseScrolls,
+];
+
+#[simple_enum]
+pub enum DivineValue {
+    None,
+    One(bool),
+    Two(bool),
+    Three(bool),
+    Four(bool),
+}
+
+impl DivineValue {
+    pub fn get_max_spell_slots(&self, mut level: u8) -> [u32; 5] {
+        if let Self::One(_) = self {
+            level = (level as f64 / 2.0).ceil() as u8;
+        }
+        let mut cleric: [u32; 5] = match level {
+            ..=1 => [0, 0, 0, 0, 0],
+            2 => [1, 0, 0, 0, 0],
+            3 => [2, 0, 0, 0, 0],
+            4 => [2, 1, 0, 0, 0],
+            5 => [2, 2, 0, 0, 0],
+            6 => [2, 2, 1, 1, 0],
+            7 => [2, 2, 2, 1, 1],
+            8 => [3, 3, 2, 2, 1],
+            9 => [3, 3, 3, 2, 2],
+            10 => [4, 4, 3, 3, 2],
+            11 => [4, 4, 4, 3, 3],
+            12 => [5, 5, 4, 4, 3],
+            13 => [5, 5, 5, 4, 3],
+            14.. => [6, 5, 5, 5, 4],
+        };
+        match self {
+            Self::None => [0, 0, 0, 0, 0],
+            Self::One(_) => cleric,
+            Self::Two(_) => cleric,
+            Self::Three(_) => {
+                for i in &mut cleric {
+                    *i += (*i as f64 / 3.0).round() as u32;
+                }
+                cleric
+            },
+            Self::Four(_) => {
+                for i in &mut cleric {
+                    *i += (*i as f64 / 2.0).round() as u32;
+                }
+                if cleric[0] == 0 {
+                    cleric[0] = 1;
+                }
+                cleric 
+            },
+        }
+    }
+}
+
+#[simple_enum]
+pub enum ArcaneValue {
+    None,
+    One(bool),
+    Two(bool),
+    Three(bool),
+    Four,
+}
+
+impl ArcaneValue {
+    pub fn get_max_spell_slots(&self, mut level: u8) -> [u32; 6] {
+        match self {
+            Self::None => {
+                return [0, 0, 0, 0, 0, 0];
+            },
+            Self::One(delayed) => {
+                if *delayed {
+                    if level > 7 {
+                        level -= 7;
+                    } else {
+                        level = 0;
+                    }
+                } else {
+                    level = (level as f64 / 3.0).floor() as u8;
+                }
+            },
+            Self::Two(delayed) => {
+                if *delayed {
+                    if level > 5 {
+                        level -= 5;
+                    } else {
+                        level = 0;
+                    }
+                } else {
+                    if level == 1 {
+                        level = 0;
+                    } else {
+                        level = (level as f64 / 2.0).round() as u8;
+                    }
+                }
+            },
+            Self::Three(delayed) => {
+                if *delayed {
+                    if level > 3 {
+                        level -= 3;
+                    } else {
+                        level = 0;
+                    }
+                } else {
+                    level = (level as f64 * (2.0 / 3.0)).round() as u8;
+                }
+            },
+            Self::Four => {},
+        }
+        match level {
+            0 => [0, 0, 0, 0, 0, 0],
+            1 => [1, 0, 0, 0, 0, 0],
+            2 => [2, 0, 0, 0, 0, 0],
+            3 => [2, 1, 0, 0, 0, 0],
+            4 => [2, 2, 0, 0, 0, 0],
+            5 => [2, 2, 1, 0, 0, 0],
+            6 => [2, 2, 2, 0, 0, 0],
+            7 => [3, 2, 2, 1, 0, 0],
+            8 => [3, 3, 2, 2, 0, 0],
+            9 => [3, 3, 3, 2, 1, 0],
+            10 => [3, 3, 3, 3, 2, 0],
+            11 => [4, 3, 3, 3, 2, 1],
+            12 => [4, 4, 3, 3, 3, 2],
+            13 => [4, 4, 4, 3, 3, 2],
+            14.. => [4, 4, 4, 4, 3, 3],
+        }
+    }
+
+    pub fn get_repertoire_size(&self, level: u8, int_mod: i32) -> [u32; 6] {
+        let mut rep = self.get_max_spell_slots(level);
+        if int_mod > 0 {
+            for i in &mut rep {
+                if *i > 0 {
+                    *i += int_mod as u32;
+                }
+            }
+        }
+        rep
+    }
 }

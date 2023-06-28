@@ -144,6 +144,19 @@ impl StatusEffects {
         false
     }
 
+    pub fn is_untargetable(&self) -> bool {
+        for effect in &self.effects {
+            match effect {
+                StatusEffect::Dead |
+                StatusEffect::Dying => {
+                    return true;
+                },
+                _ => {},
+            }
+        }
+        false
+    }
+
     pub fn is_incapacitated(&self) -> bool {
         for effect in &self.effects {
             match effect {
@@ -241,7 +254,7 @@ impl DamageRoll {
 }
 
 /// Stores ALL active modifiers for every stat, including permanent and temporary modifiers. Each
-/// modifier needs a unique key that specifies where it cam from (proficiencies, class bonuses, etc).
+/// modifier needs a unique key that specifies where it came from (proficiencies, class bonuses, etc).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatModifiers {
     pub melee_attack: StatMod<i32>,
@@ -344,16 +357,20 @@ impl<T: AddAssign + SubAssign + Clone + Copy> StatMod<T> {
 /// An active fight between combatants.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Fight {
-    pub combatants: Vec<(Owner, CombatantType)>,
+    pub started: bool,
+    pub combatants: HashSet<(Owner, CombatantType)>,
+    pub turn_order: Vec<(Owner, CombatantType)>,
     pub current_turn: usize,
     pub ongoing_round: bool,
     pub awaiting_response: Option<Owner>,
 }
 
 impl Fight {
-    pub fn new(combatants: Vec<(Owner, CombatantType)>) -> Self {
+    pub fn new() -> Self {
         Self {
-            combatants,
+            started: false,
+            combatants: HashSet::new(),
+            turn_order: Vec::new(),
             current_turn: 0,
             ongoing_round: false,
             awaiting_response: None,
@@ -361,16 +378,19 @@ impl Fight {
     }
 
     pub fn get_current_actor(&self) -> CombatantType {
-        self.combatants.get(self.current_turn).map_or(CombatantType::not_found(), |(_, t)| t.clone())
+        self.turn_order.get(self.current_turn).map_or(CombatantType::not_found(), |(_, t)| t.clone())
     }
 
     pub fn start_round(&mut self, data: &mut DMAppData) {
-        let mut drained = self.combatants.drain(..).map(|(owner, ctype)| {
-            let mut r = dice::roll(DiceRoll::simple(1, 6)) as i32;
-            r += data.get_combatant_stats_alt(&ctype, |s| s.modifiers.initiative.total()).unwrap_or(0);
-            (owner, ctype, r)
-        }).collect::<Vec<(Owner, CombatantType, i32)>>();
-        drained.sort_unstable_by(|a, b| {
+        let mut list = vec![];
+        for (owner, ctype) in &self.combatants {
+            if !data.get_combatant_stats_alt(ctype, |c| c.status_effects.is_incapacitated()).unwrap_or(true) {
+                let mut r = dice::roll(DiceRoll::simple(1, 6)) as i32;
+                r += data.get_combatant_stats_alt(ctype, |c| c.modifiers.initiative.total()).unwrap_or(0);
+                list.push((owner.clone(), ctype.clone(), r));
+            }
+        }
+        list.sort_unstable_by(|a, b| {
             if a.2 == b.2 {
                 match a.0 {
                     Owner::DM => {
@@ -398,14 +418,14 @@ impl Fight {
                 a.2.cmp(&b.2)
             }
         });
-        self.combatants = drained.into_iter().map(|(o, c, _)| (o, c)).collect();
-        self.combatants.reverse();
+        self.turn_order = list.into_iter().map(|(o, c, _)| (o, c)).collect();
+        self.turn_order.reverse();
         data.log_public("Round started!");
         self.ongoing_round = true;
     }
 
     pub fn next_turn(&mut self, data: &mut DMAppData) {
-        if let Some((owner, ctype)) = self.combatants.get(self.current_turn) {
+        if let Some((owner, ctype)) = self.turn_order.get_mut(self.current_turn) {
             if data.get_combatant_stats_alt(ctype, |s| s.status_effects.is_incapacitated()).unwrap_or(false) {
                 data.log_public(format!("{} is unable to act!", ctype.name()));
                 self.current_turn += 1;
@@ -419,13 +439,24 @@ impl Fight {
                 if comb.id() == ctype.id() {
                     continue;
                 }
+                if data.get_combatant_stats_alt(comb, |c| c.status_effects.is_untargetable()).unwrap_or(true) {
+                    continue;
+                }
                 list.push(comb.clone());
+            }
+            if let Owner::Player(p) = &owner {
+                if !data.connected_users.contains_key(p) {
+                    *owner = Owner::DM;
+                }
             }
             match owner {
                 Owner::DM => {
+                    data.temp_state.selected_target = 0;
                     data.temp_state.combatant_list = list;
                 },
                 Owner::Player(player) => {
+                    data.temp_state.selected_target = 0;
+                    data.temp_state.combatant_list = list.clone();
                     data.send_to_user(ClientBoundPacket::DecideCombatAction(ctype.clone(), list), player.clone());
                 },
             }
@@ -592,7 +623,7 @@ pub enum AttackResult {
 
 /// Represents who actually gets to make the decisions for this combatant; i.e. who is currently
 /// in control of them (PC's are not always controlled by players, for example if they are charmed).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub enum Owner {
     DM,
     Player(String),
@@ -627,7 +658,7 @@ impl CombatantType {
     pub fn id(&self) -> String {
         match self {
             Self::Enemy(type_id, id, _) => {
-                format!("{} {}", type_id, id)
+                format!("{}_{}", type_id, id)
             },
             Self::PC(_, character) => {
                 character.clone()

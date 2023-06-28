@@ -11,6 +11,7 @@ use crate::enemy::AttackRoutine;
 use crate::item::{WeaponDamage, MeleeDamage};
 use crate::player_app::PlayerAppData;
 use crate::proficiency::{Proficiency, ProficiencyInstance};
+use crate::spell::SpellRegistry;
 
 /// A packet sent from the server to a client.
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,8 +31,13 @@ pub enum ClientBoundPacket {
     UpdatePlayerNotes(String),
     /// Sent to notify a player that they must make a combat action.
     DecideCombatAction(CombatantType, Vec<CombatantType>),
+    /// Sent to give the client a clone of the class registry.
     UpdateClassRegistry(Registry<Class>),
+    /// Sent to give the client a clone of the proficiency registry.
     UpdateProfRegistry(HashMap<String, Proficiency>),
+    /// Sent to give the client a clone of the spell registry.
+    UpdateSpellRegistry(SpellRegistry),
+    RespondToRequest(Request, bool),
 }
 
 impl ClientBoundPacket {
@@ -39,6 +45,10 @@ impl ClientBoundPacket {
         match self {
             Self::ChatMessage(msg) => {
                 data.logs.insert(0, msg);
+                if data.unread_messages == 0 {
+                    data.unread_msg_buffer = true;
+                }
+                data.unread_messages += 1;
             },
             Self::LogInResult(success) => {
                 data.logged_in = success;
@@ -73,6 +83,7 @@ impl ClientBoundPacket {
                 data.notes = notes;
             },
             Self::DecideCombatAction(this, combatants) => {
+                data.selected_target = 0;
                 data.character_awaiting_action = Some(this);
                 data.combatant_list = combatants;
                 data.window_states.insert("combat_action".to_owned(), true);
@@ -86,6 +97,12 @@ impl ClientBoundPacket {
                 }
                 data.sorted_prof_list.sort();
                 data.proficiency_registry = profs;
+            },
+            Self::UpdateSpellRegistry(spells) => {
+                data.spell_registry = spells;
+            },
+            Self::RespondToRequest(request, approved) => {
+                data.requests.set_approval(request, approved);
             },
         }
     }
@@ -114,8 +131,11 @@ pub enum ServerBoundPacket {
     EquipInventoryItem(String, PlayerEquipSlot, usize),
     /// Sent when a player tries to unequip an item.
     UnequipInventoryItem(String, PlayerEquipSlot),
+    /// Sent when a saving throw is made by a PC.
     SavingThrow(String, SavingThrowType),
+    /// Sent when a player selects a new proficiency.
     PickNewProficiency(String, bool, String, Option<String>),
+    MakeRequest(Request),
 }
 
 impl ServerBoundPacket {
@@ -131,6 +151,10 @@ impl ServerBoundPacket {
                 }
                 msg.insert_str(0, format!("[{}]: ", name).as_str());
                 data.log_public(msg);
+                if data.temp_state.unread_messages == 0 {
+                    data.temp_state.unread_msg_buffer = true;
+                }
+                data.temp_state.unread_messages += 1;
             },
             Self::AttemptLogIn(username, password) => {
                 if let Some(pw) = data.known_users.get(&username) {
@@ -151,6 +175,7 @@ impl ServerBoundPacket {
                         }
                         data.send_to_user_by_addr(ClientBoundPacket::UpdateClassRegistry(data.class_registry.clone()), user);
                         data.send_to_user_by_addr(ClientBoundPacket::UpdateProfRegistry(data.proficiency_registry.clone()), user);
+                        data.send_to_user_by_addr(ClientBoundPacket::UpdateSpellRegistry(data.spell_registry.clone()), user);
                         return;
                     }
                 }
@@ -471,6 +496,11 @@ impl ServerBoundPacket {
                     }
                 }
             },
+            Self::MakeRequest(request) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    data.temp_state.requests.push((username, request));
+                }
+            },
         }
     }
 }
@@ -504,4 +534,10 @@ impl std::fmt::Display for ClientFacingError {
             Self::CharacterNameInvalid => "That name is disallowed.",
         })
     }
+}
+
+#[simple_enum(display)]
+pub enum Request {
+    /// Generate a new set of characters.
+    GenerateCharacters,
 }

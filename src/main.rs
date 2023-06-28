@@ -1,6 +1,9 @@
-#![windows_subsystem = "windows"]
+//#![windows_subsystem = "windows"]
 
 use std::{rc::Rc, cell::RefCell};
+
+use eframe::NativeOptions;
+use serde::{Serialize, Deserialize};
 
 /// Simulated dice roller.
 pub mod dice;
@@ -28,6 +31,8 @@ pub mod enemy;
 pub mod item;
 /// Proficiency logic.
 pub mod proficiency;
+/// Everything related to spells and magic.
+pub mod spell;
 
 fn main() -> Result<(), eframe::Error> {
     // have to do some fuckery with interior mutability to store the button press between applications
@@ -38,6 +43,7 @@ fn main() -> Result<(), eframe::Error> {
         eframe::NativeOptions {
             centered: true,
             initial_window_size: Some(eframe::egui::vec2(400.0, 300.0)),
+            follow_system_theme: false,
             ..Default::default()
         },
         Box::new(|_ctx| {
@@ -46,10 +52,21 @@ fn main() -> Result<(), eframe::Error> {
     );
 
     if let Some(dm) = *is_dm.borrow() {
-        if dm {
-            return dm_app::run();
+        let prefs = if let Ok(s) = std::fs::read_to_string("preferences.ron") {
+            if let Ok(p) = ron::from_str::<AppPreferences>(&s) {
+                p
+            } else {
+                let _ = std::fs::write("preferences.ron", ron::to_string(&AppPreferences::default()).unwrap_or(String::new()));
+                AppPreferences::default()
+            }
         } else {
-            return player_app::run();
+            let _ = std::fs::write("preferences.ron", ron::to_string(&AppPreferences::default()).unwrap_or(String::new()));
+            AppPreferences::default()
+        };
+        if dm {
+            return dm_app::run(prefs);
+        } else {
+            return player_app::run(prefs);
         }
     }
     Ok(())
@@ -77,5 +94,47 @@ impl eframe::App for StartupApp {
                 }
             });
         });
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppPreferences {
+    pub dm_window: Option<WindowPreferences>,
+    pub player_window: Option<WindowPreferences>,
+    pub player_last_ip: Option<String>,
+    pub player_login: Option<(String, String)>,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            dm_window: None,
+            player_window: None,
+            player_last_ip: None,
+            player_login: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WindowPreferences {
+    pub pos: (f32, f32),
+    pub size: (f32, f32),
+}
+
+impl WindowPreferences {
+    pub fn new() -> Self {
+        Self {
+            pos: (0.0, 0.0),
+            size: (100.0, 100.0),
+        }
+    }
+    pub fn to_native_options(&self) -> NativeOptions {
+        NativeOptions {
+            initial_window_pos: Some(eframe::egui::pos2(self.pos.0, self.pos.1)),
+            initial_window_size: Some(eframe::egui::vec2(self.size.0, self.size.1)),
+            follow_system_theme: false,
+            ..Default::default()
+        }
     }
 }

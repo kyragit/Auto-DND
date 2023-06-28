@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
-use crate::{dice::{roll, DiceRoll}, class::{Class, SavingThrowProgressionType, HitDie}, race::Race, combat::{CombatantStats, DamageRoll, StatModifiers, StatusEffects}, item::{Item, ItemType, Encumbrance}, enemy::AttackRoutine, proficiency::{Proficiencies, ProficiencyInstance, PROF_CODE_MAP}};
+use crate::{dice::{roll, DiceRoll}, class::{Class, SavingThrowProgressionType, HitDie, DivineValue, ArcaneValue}, race::{Race, RaceTable}, combat::{CombatantStats, DamageRoll, StatModifiers, StatusEffects}, item::{Item, ItemType, Encumbrance}, enemy::AttackRoutine, proficiency::{Proficiencies, ProficiencyInstance, PROF_CODE_MAP}};
+use array_macro::array;
 use serde::{Deserialize, Serialize};
 use simple_enum_macro::simple_enum;
 
@@ -17,12 +18,14 @@ pub struct PlayerCharacter {
     pub xp_to_level: u32,
     pub inventory: PlayerInventory,
     pub proficiencies: Proficiencies,
+    pub divine_spells: Option<DivineSpellcaster>,
+    pub arcane_spells: Option<ArcaneSpellcaster>,
     pub notes: String,
 }
 
 impl PlayerCharacter {
     pub fn random() -> Self {
-        let race = Race::random();
+        let race = RaceTable::StandardFantasy.random_race();
         let class = Class::default();
         Self {
             combat_stats: CombatantStats { 
@@ -40,37 +43,101 @@ impl PlayerCharacter {
             xp_to_level: 0,
             class,
             title: String::new(),
-            level: 1,
+            level: 0,
             xp: 0,
             inventory: PlayerInventory::empty(),
             proficiencies: Proficiencies::new(),
+            divine_spells: None,
+            arcane_spells: None,
             notes: String::new(),
         }
     }
 
     pub fn initialize(&mut self) {
-        let hp = self.roll_hit_die();
-        self.xp_to_level = self.class.calculate_next_level_cost(1);
-        self.combat_stats.health.max_hp = hp;
-        self.combat_stats.health.current_hp = hp as i32;
         self.combat_stats.saving_throws = SavingThrows::calculate_simple(self.class.saving_throw_progression_type, self.level);
         self.combat_stats.modifiers.melee_attack.add("strength", self.combat_stats.attributes.modifier(Attr::STR));
         self.combat_stats.modifiers.melee_damage.add("strength", self.combat_stats.attributes.modifier(Attr::STR));
         self.combat_stats.modifiers.missile_attack.add("dexterity", self.combat_stats.attributes.modifier(Attr::DEX));
         self.combat_stats.modifiers.armor_class.add("dexterity", self.combat_stats.attributes.modifier(Attr::DEX));
         self.combat_stats.modifiers.initiative.add("dexterity", self.combat_stats.attributes.modifier(Attr::DEX));
-        self.combat_stats.modifiers.save_petrification_paralysis.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
-        self.combat_stats.modifiers.save_poison_death.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
-        self.combat_stats.modifiers.save_blast_breath.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
-        self.combat_stats.modifiers.save_staffs_wands.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
-        self.combat_stats.modifiers.save_spells.add("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
+        self.combat_stats.modifiers.add_all_saves("wisdom", self.combat_stats.attributes.modifier(Attr::WIS));
         let xp_gain = self.class.prime_reqs.iter().map(|attr| self.combat_stats.attributes.modifier(*attr)).min();
         self.combat_stats.modifiers.xp_gain.add("prime_reqs", xp_gain.unwrap_or(0) as f64 * 0.05);
-        self.title = self.class.titles.get(1);
         self.proficiencies.class_slots = 1;
         self.proficiencies.general_slots = 1;
         if self.combat_stats.attributes.modifier(Attr::INT) > 0 {
             self.proficiencies.general_slots += self.combat_stats.attributes.modifier(Attr::INT) as u8;
+        }
+        if self.class.divine_value != DivineValue::None {
+            self.divine_spells = Some(DivineSpellcaster {
+                spell_slots: array![(0, 0); 5],
+                spell_repertoire: array![HashSet::new(); 5],
+            });
+        }
+        if self.class.arcane_value != ArcaneValue::None {
+            self.arcane_spells = Some(ArcaneSpellcaster {
+                spell_slots: array![(0, 0); 6],
+                spell_repertoire: array![(HashSet::new(), 0); 6],
+            });
+        }
+        self.level_up();
+    }
+
+    pub fn level_up(&mut self) {
+        if self.level >= self.class.maximum_level {
+            return;
+        }
+        self.level += 1;
+        let hp = self.roll_hit_die();
+        self.combat_stats.health.max_hp += hp;
+        self.combat_stats.health.current_hp = self.combat_stats.health.max_hp as i32;
+        self.combat_stats.saving_throws = SavingThrows::calculate_simple(self.class.saving_throw_progression_type, self.level);
+        self.combat_stats.attack_throw = self.class.attack_throw_progression.calculate(self.level);
+        self.xp_to_level = self.class.calculate_next_level_cost(self.level);
+        self.title = self.class.titles.get(self.level);
+        match self.level {
+            5 | 9 | 13 => {
+                self.proficiencies.general_slots += 1;
+            },
+            _ => {},
+        }
+        match self.class.saving_throw_progression_type {
+            SavingThrowProgressionType::Fighter => {
+                match self.level {
+                    3 | 6 | 9 | 12 => {
+                        self.proficiencies.class_slots += 1;
+                    },
+                    _ => {},
+                }
+            },
+            SavingThrowProgressionType::Cleric | SavingThrowProgressionType::Thief => {
+                match self.level {
+                    4 | 8 | 12 => {
+                        self.proficiencies.class_slots += 1;
+                    },
+                    _ => {},
+                }
+            },
+            SavingThrowProgressionType::Mage => {
+                match self.level {
+                    6 | 12 => {
+                        self.proficiencies.class_slots += 1;
+                    },
+                    _ => {},
+                }
+            },
+        }
+        if let Some(divine) = &mut self.divine_spells {
+            let slots = self.class.divine_value.get_max_spell_slots(self.level);
+            divine.spell_slots = [(slots[0], slots[0]), (slots[1], slots[1]), (slots[2], slots[2]), (slots[3], slots[3]), (slots[4], slots[4])];
+        }
+        if let Some(arcane) = &mut self.arcane_spells {
+            let slots = self.class.arcane_value.get_max_spell_slots(self.level);
+            let rep = self.class.arcane_value.get_repertoire_size(self.level, self.combat_stats.attributes.modifier(Attr::INT));
+            arcane.spell_slots = [(slots[0], slots[0]), (slots[1], slots[1]), (slots[2], slots[2]), (slots[3], slots[3]), (slots[4], slots[4]), (slots[5], slots[5])];
+            for i in 0..=5 {
+                arcane.spell_repertoire[i].1 = rep[i];
+            }
         }
     }
 
@@ -97,18 +164,12 @@ impl PlayerCharacter {
         }
     }
 
-    pub fn level_up(&mut self) {
-        if self.level >= self.class.maximum_level {
-            return;
+    pub fn add_xp(&mut self, mut amount: u32) {
+        amount = (amount as i32 + (amount as f64 * self.combat_stats.modifiers.xp_gain.total()).round() as i32) as u32;
+        self.xp += amount;
+        while self.xp >= self.xp_to_level {
+            self.level_up();
         }
-        self.level += 1;
-        let hp = self.roll_hit_die();
-        self.combat_stats.health.max_hp += hp;
-        self.combat_stats.health.current_hp = self.combat_stats.health.max_hp as i32;
-        self.combat_stats.saving_throws = SavingThrows::calculate_simple(self.class.saving_throw_progression_type, self.level);
-        self.combat_stats.attack_throw = self.class.attack_throw_progression.calculate(self.level);
-        self.xp_to_level = self.class.calculate_next_level_cost(self.level);
-        self.title = self.class.titles.get(self.level);
     }
 
     pub fn add_prof(&mut self, id: &str, prof: ProficiencyInstance) {
@@ -120,6 +181,10 @@ impl PlayerCharacter {
         if let Some(prof) = self.proficiencies.profs.remove(id) {
             PROF_CODE_MAP.trigger_remove(&id.0, self, &prof);
         }
+    }
+
+    pub fn has_prof(&self, id: impl Into<String>, spec: Option<impl Into<String>>) -> bool {
+        self.proficiencies.profs.contains_key(&(id.into(), spec.map(|s| s.into())))
     }
 }
 
@@ -194,8 +259,8 @@ pub struct Health {
 impl Health {
     pub fn new() -> Self {
         Self {
-            max_hp: 1,
-            current_hp: 1,
+            max_hp: 0,
+            current_hp: 0,
         }
     }
 }
@@ -611,4 +676,18 @@ enum Currency {
     EP,
     GP,
     PP,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DivineSpellcaster {
+    /// form is [(current, maximum); spell_level]
+    pub spell_slots: [(u32, u32); 5],
+    pub spell_repertoire: [HashSet<String>; 5],
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ArcaneSpellcaster {
+    /// form is [(current, maximum); spell_level]
+    pub spell_slots: [(u32, u32); 6],
+    pub spell_repertoire: [(HashSet<String>, u32); 6],
 }

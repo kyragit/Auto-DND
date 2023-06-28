@@ -144,4 +144,12 @@ impl Proficiencies {
             profs: HashMap::new(),
         }
     }
+
+    pub fn has_prof(&self, prof: impl Into<String>) -> bool {
+        self.profs.contains_key(&(prof.into(), None))
+    }
+
+    pub fn has_prof_and_spec(&self, prof: impl Into<String>, spec: impl Into<String>) -> bool {
+        self.profs.contains_key(&(prof.into(), Some(spec.into())))
+    }
 }

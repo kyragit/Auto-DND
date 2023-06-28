@@ -1,5 +1,5 @@
 use crate::{dm_app::DMAppData, player_app::PlayerAppData, dice::{DiceRoll, ModifierType, Drop}, combat::DamageRoll};
-use eframe::egui::{self, WidgetText, InnerResponse, Ui, RichText};
+use eframe::egui::{self, WidgetText, InnerResponse, Ui, RichText, Button};
 
 pub trait CommonApp<'d> {
     fn get_data(&'d mut self) -> CommonAppData<'d>;
@@ -71,6 +71,7 @@ pub enum CommonAppData<'d> {
 /// - `unique_id`: a string representing this tab bar uniquely. For technical reasons, it is 
 /// important that this is globally unique.
 /// - `ui`: the `Ui` to add the tab bar to.
+/// - `on_change`: called when the tab changes, passing in the old tab and the new tab (in that order).
 /// - `func`: a function that contains your ui code. The selected tab is passed as an argument 
 /// to react to.
 /// 
@@ -85,11 +86,15 @@ pub enum CommonAppData<'d> {
 ///     });
 /// });
 /// ```
-pub fn tabs<R, T: TabValue, F: FnOnce(&mut Ui, T) -> R>(state: &mut T, unique_id: String, ui: &mut Ui, func: F) -> R {
+pub fn tabs<R, T: TabValue, F: FnOnce(&mut Ui, T) -> R, C: FnOnce(T, T)>(state: &mut T, unique_id: String, ui: &mut Ui, on_change: C, func: F) -> R {
     egui::TopBottomPanel::top(unique_id).show_inside(ui, |ui| {
         ui.horizontal(|ui| {
             for tab in T::iterate() {
-                ui.selectable_value(state, tab, RichText::new(tab.display()).background_color(ui.style().visuals.faint_bg_color));
+                let old = *state;
+                if ui.selectable_value(state, tab, RichText::new(tab.display()).background_color(ui.style().visuals.faint_bg_color)).clicked() {
+                    on_change(old, tab);
+                    break;
+                }
             }
         });
     });
@@ -194,4 +199,8 @@ pub fn damage_roll_editor(ui: &mut Ui, roll: &mut DamageRoll) {
     ui.add(egui::Slider::new(&mut roll.amount, 1..=10).text("Amount").clamp_to_range(false));
     ui.add(egui::Slider::new(&mut roll.sides, 1..=20).text("Sides").clamp_to_range(false));
     ui.add(egui::Slider::new(&mut roll.modifier, -10..=10).text("Modifier").clamp_to_range(false));
+}
+
+pub fn back_arrow(ui: &mut Ui) -> bool {
+    ui.add(Button::new("\u{e953}").frame(false)).clicked()
 }

@@ -1,3 +1,5 @@
+use std::{iter::Peekable, str::Chars};
+
 use rand::prelude::*;
 use serde::{Serialize, Deserialize};
 
@@ -31,6 +33,165 @@ impl DiceRoll {
             drop,
             min_value,
         }
+    }
+
+    pub fn from_notation(s: impl Into<String>) -> Result<Self, String> {
+        // N'd'M('&')(['+'|'-'|['x'|'*']|'/'(['u'|'d'])]A)('_'[['L'|'l'](X)|['H'|'h'](Y)])('>'('=')B)
+        let s: String = s.into();
+        let mut iter = s.chars().peekable();
+        let read_num = |iter: &mut Peekable<Chars>| -> Option<u32> {
+            let mut num = String::new();
+            while let Some(next) = iter.peek() {
+                if next.is_ascii_digit() {
+                    num.push(*next);
+                    iter.next();
+                } else {
+                    break;
+                }
+            }
+            if !num.is_empty() {
+                Some(num.parse::<u32>().unwrap_or(0))
+            } else {
+                None
+            }
+        };
+        let mut roll = DiceRoll::simple(1, 0);
+        if let Some(amount) = read_num(&mut iter) {
+            if amount > 0 {
+                roll.amount = amount;
+            } else {
+                return Err("Cannot roll zero dice.".to_owned());
+            }
+        }
+        if iter.next().unwrap_or('q') != 'd' {
+            return Err("Missing 'd' character.".to_owned());
+        }
+        if let Some(sides) = read_num(&mut iter) {
+            if sides > 0 {
+                roll.sides = sides;
+            } else {
+                return Err("Cannot roll a zero-sided dice.".to_owned());
+            }
+        } else {
+            return Err("You must specifiy a number of sides.".to_owned());
+        }
+        if *iter.peek().unwrap_or(&'q') == '&' {
+            roll.apply_modifier_to_all = true;
+            iter.next();
+        }
+
+        match *iter.peek().unwrap_or(&'q') {
+            '+' => {
+                roll.modifier_type = ModifierType::Add;
+                iter.next();
+                if let Some(n) = read_num(&mut iter) {
+                    roll.modifier = n as i32;
+                } else {
+                    return Err("Unexpected '+' without value.".to_owned());
+                }
+            },
+            '-' => {
+                roll.modifier_type = ModifierType::Add;
+                iter.next();
+                if let Some(n) = read_num(&mut iter) { 
+                    roll.modifier = -(n as i32);   
+                } else {
+                    return Err("Unexpected '-' without value.".to_owned());
+                }
+            },
+            '*' | 'x' => {
+                roll.modifier_type = ModifierType::Multiply;
+                iter.next();
+                if let Some(n) = read_num(&mut iter) {
+                    roll.modifier = n as i32;
+                } else {
+                    return Err("Unexpected '*' without value.".to_owned());
+                }
+            },
+            '/' => {
+                iter.next();
+                match *iter.peek().unwrap_or(&'q') {
+                    'u' => {
+                        roll.modifier_type = ModifierType::DivideCeil;
+                        iter.next();
+                    },
+                    'd' => {
+                        roll.modifier_type = ModifierType::DivideFloor;
+                        iter.next();
+                    },
+                    _ => {
+                        roll.modifier_type = ModifierType::DivideRound;
+                    },
+                }
+                if let Some(n) = read_num(&mut iter) {
+                    roll.modifier = n as i32;
+                } else {
+                    return Err("Unexpected '/' without value.".to_owned());
+                }
+            },
+            _ => {},
+        }
+        if *iter.peek().unwrap_or(&'q') == '_' {
+            iter.next();
+            match *iter.peek().unwrap_or(&'q') {
+                'h' | 'H' => {
+                    iter.next();
+                    if let Some(n) = read_num(&mut iter) {
+                        if n < roll.amount {
+                            roll.drop = Drop::DropHighest(n);
+                        } else {
+                            return Err(format!("Cannot drop {} dice when only rolling {}!", n, roll.amount));
+                        }
+                    } else {
+                        roll.drop = Drop::DropHighest(1);
+                    }
+                },
+                'l' | 'L' => {
+                    iter.next();
+                    if let Some(n) = read_num(&mut iter) {
+                        if n < roll.amount {
+                            roll.drop = Drop::DropLowest(n);
+                        } else {
+                            return Err(format!("Cannot drop {} dice when only rolling {}!", n, roll.amount));
+                        }
+                    } else {
+                        roll.drop = Drop::DropLowest(1);
+                    }
+                },
+                _ => {
+                    return Err("Unexpected '_' without 'l' or 'h'.".to_owned());
+                },
+            }
+        }
+        if *iter.peek().unwrap_or(&'q') == '>' {
+            iter.next();
+            let mut inc = false;
+            let mut neg = false;
+            if *iter.peek().unwrap_or(&'q') == '=' {
+                inc = true;
+                iter.next();
+            }
+            if *iter.peek().unwrap_or(&'q') == '-' {
+                neg = true;
+                iter.next();
+            }
+            if let Some(n) = read_num(&mut iter) {
+                let mut n = n as i32;
+                if neg {
+                    n = -n;
+                }
+                if !inc {
+                    n += 1;
+                }
+                roll.min_value = n;
+            } else {
+                return Err("Unexpected '>' without value.".to_owned());
+            }
+        }
+        if let Some(t) = iter.next() {
+            return Err(format!("Unexpected token '{}'.", t));
+        }
+        Ok(roll)
     }
 
     pub fn to_notation(&self) -> String {
