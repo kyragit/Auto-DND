@@ -33,6 +33,8 @@ pub mod item;
 pub mod proficiency;
 /// Everything related to spells and magic.
 pub mod spell;
+pub mod party;
+pub mod map;
 
 fn main() -> Result<(), eframe::Error> {
     // have to do some fuckery with interior mutability to store the button press between applications

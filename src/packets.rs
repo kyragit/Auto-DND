@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use egui::Color32;
 use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
 use crate::character::{PlayerCharacter, PlayerEquipSlot};
 use crate::class::Class;
-use crate::combat::{CombatantType, DamageRoll, SavingThrowType};
+use crate::combat::{Combatant, SavingThrowType, PreRoundAction, MovementAction, TurnType, Owner, AttackAction};
+use crate::common_ui::ChatMessage;
 use crate::dm_app::{DMAppData, UserData, Registry};
-use crate::enemy::AttackRoutine;
-use crate::item::{WeaponDamage, MeleeDamage};
-use crate::player_app::PlayerAppData;
+use crate::party::Party;
+use crate::player_app::{PlayerAppData, CombatState};
 use crate::proficiency::{Proficiency, ProficiencyInstance};
 use crate::spell::SpellRegistry;
 
@@ -18,7 +19,7 @@ use crate::spell::SpellRegistry;
 pub enum ClientBoundPacket {
     /// Logs a message in the chat. Note that this may be called when a user sends a chat message,
     /// the server sends a chat message, or any time a message is sent to a client.
-    ChatMessage(String),
+    ChatMessage(ChatMessage),
     /// The result of a log in attempt.
     LogInResult(bool),
     /// The result of an attempt to create an account.
@@ -29,8 +30,6 @@ pub enum ClientBoundPacket {
     UpdateCharacter(String, PlayerCharacter),
     /// Sent when the player recieves their personal notes from the server upon login.
     UpdatePlayerNotes(String),
-    /// Sent to notify a player that they must make a combat action.
-    DecideCombatAction(CombatantType, Vec<CombatantType>),
     /// Sent to give the client a clone of the class registry.
     UpdateClassRegistry(Registry<Class>),
     /// Sent to give the client a clone of the proficiency registry.
@@ -38,13 +37,15 @@ pub enum ClientBoundPacket {
     /// Sent to give the client a clone of the spell registry.
     UpdateSpellRegistry(SpellRegistry),
     RespondToRequest(Request, bool),
+    UpdateCombatState(Option<CombatState>),
+    UpdateParties(HashMap<String, Party>),
 }
 
 impl ClientBoundPacket {
     pub fn handle(self, data: &mut PlayerAppData) {
         match self {
             Self::ChatMessage(msg) => {
-                data.logs.insert(0, msg);
+                data.logs.insert(0, msg.to_layout_job());
                 if data.unread_messages == 0 {
                     data.unread_msg_buffer = true;
                 }
@@ -55,6 +56,7 @@ impl ClientBoundPacket {
             },
             Self::CreateAccountResult(success, username, password) => {
                 if success {
+                    data.username = username.clone();
                     data.send_to_server(ServerBoundPacket::AttemptLogIn(username, password));
                 }
             },
@@ -82,12 +84,6 @@ impl ClientBoundPacket {
             Self::UpdatePlayerNotes(notes) => {
                 data.notes = notes;
             },
-            Self::DecideCombatAction(this, combatants) => {
-                data.selected_target = 0;
-                data.character_awaiting_action = Some(this);
-                data.combatant_list = combatants;
-                data.window_states.insert("combat_action".to_owned(), true);
-            },
             Self::UpdateClassRegistry(registry) => {
                 data.class_registry = registry;
             },
@@ -104,6 +100,15 @@ impl ClientBoundPacket {
             Self::RespondToRequest(request, approved) => {
                 data.requests.set_approval(request, approved);
             },
+            Self::UpdateCombatState(state) => {
+                if state.is_some() && data.combat_state.is_none() {
+                    data.combat_just_started = true;
+                }
+                data.combat_state = state;
+            },
+            Self::UpdateParties(parties) => {
+                data.parties = parties;
+            },
         }
     }
 }
@@ -112,7 +117,7 @@ impl ClientBoundPacket {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerBoundPacket {
     /// Sent when a user sends a message in chat.
-    ChatMessage(String),
+    ChatMessage(ChatMessage),
     /// Sent when a user tries to log in.
     AttemptLogIn(String, String),
     /// Sent when a user creates a new account.
@@ -123,8 +128,6 @@ pub enum ServerBoundPacket {
     RequestCharacterUpdate(String, Option<PlayerCharacter>),
     /// Sent when the player's personal notes change.
     UpdatePlayerNotes(String),
-    /// Sent when a player has decided on a combat action.
-    DecideCombatAction(CombatAction),
     /// Sent when a player tries to rearrange their inventory.
     MoveInventoryItem(String, usize, bool),
     /// Sent when a player tries to equip an item.
@@ -136,21 +139,16 @@ pub enum ServerBoundPacket {
     /// Sent when a player selects a new proficiency.
     PickNewProficiency(String, bool, String, Option<String>),
     MakeRequest(Request),
+    MakePreRoundDeclaration(Combatant, PreRoundAction),
+    DecideMovementAction(MovementAction),
+    DecideAttackAction(AttackAction),
 }
 
 impl ServerBoundPacket {
     pub fn handle(self, data: &mut DMAppData, user: SocketAddr) {
         match self {
-            Self::ChatMessage(mut msg) => {
-                let mut name = String::from("error");
-                for (username, addr) in &data.connected_users {
-                    if *addr == user {
-                        name = username.clone();
-                        break;
-                    }
-                }
-                msg.insert_str(0, format!("[{}]: ", name).as_str());
-                data.log_public(msg);
+            Self::ChatMessage(msg) => {
+                data.log(msg);
                 if data.temp_state.unread_messages == 0 {
                     data.temp_state.unread_msg_buffer = true;
                 }
@@ -159,7 +157,7 @@ impl ServerBoundPacket {
             Self::AttemptLogIn(username, password) => {
                 if let Some(pw) = data.known_users.get(&username) {
                     if pw == &password {
-                        data.log_public(format!("User \"{}\" has logged in!", &username));
+                        data.log(ChatMessage::no_sender(format!("User \"{}\" has logged in!", &username)).blue());
                         data.connected_users.insert(username.clone(), user);
                         if !data.user_data.contains_key(&username) {
                             data.user_data.insert(username.clone(), UserData::new());
@@ -176,16 +174,18 @@ impl ServerBoundPacket {
                         data.send_to_user_by_addr(ClientBoundPacket::UpdateClassRegistry(data.class_registry.clone()), user);
                         data.send_to_user_by_addr(ClientBoundPacket::UpdateProfRegistry(data.proficiency_registry.clone()), user);
                         data.send_to_user_by_addr(ClientBoundPacket::UpdateSpellRegistry(data.spell_registry.clone()), user);
+                        data.send_to_user_by_addr(ClientBoundPacket::UpdateParties(data.parties.clone()), user);
                         return;
                     }
                 }
                 data.send_to_user_by_addr(ClientBoundPacket::LogInResult(false), user);
             },
-            Self::CreateAccount(username, password) => {
-                if data.known_users.contains_key(&username) || username == "server" || username.trim().is_empty() {
+            Self::CreateAccount(mut username, password) => {
+                username = username.trim().to_owned();
+                if data.known_users.contains_key(&username) || username == "server" || username.is_empty() {
                     data.send_to_user_by_addr(ClientBoundPacket::CreateAccountResult(false, username, password), user);
                 } else {
-                    data.log_private(format!("User \"{}\" has been created.", &username));
+                    data.log(ChatMessage::no_sender(format!("User \"{}\" has been created.", &username)).private().blue());
                     data.known_users.insert(username.clone(), password.clone());
                     data.send_to_user_by_addr(ClientBoundPacket::CreateAccountResult(true, username, password), user);
                 }
@@ -207,7 +207,12 @@ impl ServerBoundPacket {
                         }
                         character.initialize();
                         if let Some(prof) = data.proficiency_registry.get("adventuring") {
-                            character.add_prof("adventuring", ProficiencyInstance::from_prof(prof.clone()));
+                            character.add_prof("adventuring", ProficiencyInstance::from_prof(prof.clone(), None));
+                        }
+                        if let Some(arcane) = &mut character.arcane_spells {
+                            if let Some(spell) = data.spell_registry.random_arcane(0) {
+                                arcane.spell_repertoire[0].0.insert(spell);
+                            }
                         }
                         user_data.characters.insert(name.clone(), character);
                         data.send_to_user(ClientBoundPacket::CreateNewCharacterResult(Ok(()), name), username);
@@ -238,9 +243,6 @@ impl ServerBoundPacket {
                     }
                 }
             },
-            Self::DecideCombatAction(action) => {
-                data.fight = data.fight.take().map(|mut f| {f.resolve_action(data, action); f});
-            },
             Self::MoveInventoryItem(name, index, up) => {
                 if let Some(username) = data.get_username_by_addr(user) {
                     if let Some(user_data) = data.user_data.get_mut(&username) {
@@ -257,153 +259,23 @@ impl ServerBoundPacket {
                 }
             },
             Self::EquipInventoryItem(name, slot, index) => {
-                if slot == PlayerEquipSlot::LeftHand || slot == PlayerEquipSlot::BothHands {
-                    ServerBoundPacket::UnequipInventoryItem(name.clone(), PlayerEquipSlot::LeftHand).handle(data, user);
-                }
-                if slot == PlayerEquipSlot::RightHand || slot == PlayerEquipSlot::BothHands {
-                    ServerBoundPacket::UnequipInventoryItem(name.clone(), PlayerEquipSlot::RightHand).handle(data, user);
-                }
                 if let Some(username) = data.get_username_by_addr(user) {
                     if let Some(user_data) = data.user_data.get_mut(&username) {
                         if let Some(sheet) = user_data.characters.get_mut(&name) {
-                            sheet.inventory.equip(slot, index);
-                            if let Some(item) = sheet.inventory.get_equip_slot(slot) {
-                                if let Some(armor) = item.item_type.armor_stats {
-                                    if slot == PlayerEquipSlot::Armor {
-                                        sheet.combat_stats.modifiers.armor_class.add("armor", armor as i32);
-                                    }
-                                }
-                                if let Some(shield) = item.item_type.shield_stats {
-                                    if slot == PlayerEquipSlot::LeftHand {
-                                        sheet.combat_stats.modifiers.armor_class.add("shield", shield as i32);
-                                    }
-                                }
-                                if let Some(weapon) = &item.item_type.weapon_stats {
-                                    match &weapon.damage {
-                                        WeaponDamage::Melee(melee) => {
-                                            match melee {
-                                                MeleeDamage::OneHanded(dmg) => {
-                                                    match slot {
-                                                        PlayerEquipSlot::LeftHand => {
-                                                            sheet.combat_stats.modifiers.melee_attack.add("dual_wielding", 1);
-                                                        },
-                                                        PlayerEquipSlot::RightHand => {
-                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg.clone());
-                                                        },
-                                                        _ => {},
-                                                    }
-                                                },
-                                                MeleeDamage::Versatile(dmg1, dmg2) => {
-                                                    match slot {
-                                                        PlayerEquipSlot::LeftHand => {
-                                                            sheet.combat_stats.modifiers.melee_attack.add("dual_wielding", 1);
-                                                        },
-                                                        PlayerEquipSlot::RightHand => {
-                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg1.clone());
-                                                        },
-                                                        PlayerEquipSlot::BothHands => {
-                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg2.clone());
-                                                        },
-                                                        _ => {},
-                                                    }
-                                                },
-                                                MeleeDamage::TwoHanded(dmg) => {
-                                                    match slot {
-                                                        PlayerEquipSlot::BothHands => {
-                                                            sheet.combat_stats.damage = AttackRoutine::One(dmg.clone());
-                                                            sheet.combat_stats.modifiers.initiative.add("heavy_weapon", -1);
-                                                        },
-                                                        _ => {},
-                                                    }
-                                                },
-                                            }
-                                        },
-                                        WeaponDamage::Missile(dmg, _) => {
-                                            match slot {
-                                                PlayerEquipSlot::BothHands => {
-                                                    sheet.combat_stats.damage = AttackRoutine::One(dmg.clone());
-                                                },
-                                                _ => {},
-                                            }
-                                        },
-                                    }
-                                }
-                            }
+                            sheet.equip_item(slot, index);
                             let sheet = sheet.clone();
                             data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
                         }
                     }
                 }
             },
-            Self::UnequipInventoryItem(name, mut slot) => {
+            Self::UnequipInventoryItem(name, slot) => {
                 if let Some(username) = data.get_username_by_addr(user) {
                     if let Some(user_data) = data.user_data.get_mut(&username) {
                         if let Some(sheet) = user_data.characters.get_mut(&name) {
-                            if slot == PlayerEquipSlot::LeftHand || slot == PlayerEquipSlot::RightHand {
-                                if let Some(left) = sheet.inventory.left_hand {
-                                    if let Some(right) = sheet.inventory.right_hand {
-                                        if left == right {
-                                            slot = PlayerEquipSlot::BothHands;
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(item) = sheet.inventory.get_equip_slot(slot) {
-                                if let Some(_) = item.item_type.armor_stats {
-                                    if slot == PlayerEquipSlot::Armor {
-                                        sheet.combat_stats.modifiers.armor_class.remove("armor");
-                                    }
-                                }
-                                if let Some(_) = item.item_type.shield_stats {
-                                    if slot == PlayerEquipSlot::LeftHand {
-                                        sheet.combat_stats.modifiers.armor_class.remove("shield");
-                                    }
-                                }
-                                if let Some(weapon) = &item.item_type.weapon_stats {
-                                    match &weapon.damage {
-                                        WeaponDamage::Melee(melee) => {
-                                            match melee {
-                                                MeleeDamage::OneHanded(_) => {
-                                                    match slot {
-                                                        PlayerEquipSlot::LeftHand => {
-                                                            sheet.combat_stats.modifiers.melee_attack.remove("dual_wielding");
-                                                        },
-                                                        PlayerEquipSlot::RightHand => {
-                                                            sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
-                                                        },
-                                                        _ => {},
-                                                    }
-                                                },
-                                                MeleeDamage::Versatile(_, _) => {
-                                                    match slot {
-                                                        PlayerEquipSlot::LeftHand => {
-                                                            sheet.combat_stats.modifiers.melee_attack.remove("dual_wielding");
-                                                        },
-                                                        PlayerEquipSlot::RightHand | PlayerEquipSlot::BothHands => {
-                                                            sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
-                                                        },
-                                                        _ => {},
-                                                    }
-                                                },
-                                                MeleeDamage::TwoHanded(_) => {
-                                                    if slot == PlayerEquipSlot::BothHands {
-                                                        sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
-                                                        sheet.combat_stats.modifiers.initiative.remove("heavy_weapon");
-                                                    }
-                                                },
-                                            }
-                                        },
-                                        WeaponDamage::Missile(_, _) => {
-                                            if slot == PlayerEquipSlot::BothHands {
-                                                sheet.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
-                                            }
-                                        },
-                                    }
-                                }
-                                sheet.inventory.unequip(slot);
-                                let sheet = sheet.clone();
-                                data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
-                            }
+                            sheet.unequip_item(slot);
+                            let sheet = sheet.clone();
+                            data.send_to_user(ClientBoundPacket::UpdateCharacter(name, sheet), username);
                         }
                     }
                 }
@@ -413,9 +285,9 @@ impl ServerBoundPacket {
                     if let Some(user_data) = data.user_data.get_mut(&username) {
                         if let Some(sheet) = user_data.characters.get_mut(&name) {
                             if sheet.combat_stats.saving_throw(save) {
-                                data.log_public(format!("{} successfully made a saving throw against {}!", name, save));
+                                data.log(ChatMessage::no_sender(format!("{} successfully made a saving throw against {}!", name, save)).dice_roll().color(Color32::LIGHT_GREEN));
                             } else {
-                                data.log_public(format!("{} failed a saving throw against {}!", name, save));
+                                data.log(ChatMessage::no_sender(format!("{} failed a saving throw against {}!", name, save)).dice_roll().color(Color32::LIGHT_RED));
                             }
                         }
                     }
@@ -436,7 +308,7 @@ impl ServerBoundPacket {
                                             sheet.proficiencies.general_slots -= 1;
                                         }
                                     } else {
-                                        let mut p = ProficiencyInstance::from_prof(prof.clone());
+                                        let mut p = ProficiencyInstance::from_prof(prof.clone(), None);
                                         if prof.requires_specification {
                                             if let Some(valid) = &prof.valid_specifications {
                                                 if valid.contains(spec.as_ref().unwrap_or(&"@&%:".to_owned())) {
@@ -463,7 +335,7 @@ impl ServerBoundPacket {
                                             sheet.proficiencies.class_slots -= 1;
                                         }
                                     } else {
-                                        let mut p = ProficiencyInstance::from_prof(prof.clone());
+                                        let mut p = ProficiencyInstance::from_prof(prof.clone(), None);
                                         if prof.requires_specification {
                                             if let Some(valid) = &prof.valid_specifications {
                                                 if valid.contains(spec.as_ref().unwrap_or(&"@&%:".to_owned())) {
@@ -501,13 +373,60 @@ impl ServerBoundPacket {
                     data.temp_state.requests.push((username, request));
                 }
             },
+            Self::MakePreRoundDeclaration(combatant, action) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(fight) = &mut data.fight {
+                        if fight.started && fight.current_turn.is_none() {
+                            if fight.combatants.contains(&(Owner::Player(username.clone()), combatant.clone())) {
+                                if action == PreRoundAction::None {
+                                    fight.declarations.remove(&combatant);
+                                } else {
+                                    fight.declarations.insert(combatant.clone(), action);
+                                }
+                                // this is annoying
+                                fight.clone().update_specific_client(data, username);
+                            }
+                        }
+                    }
+                }
+            },
+            Self::DecideMovementAction(action) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(fight) = &mut data.fight {
+                        if let Some((turn, turn_type)) = &mut fight.current_turn {
+                            if let Some((owner, _, _)) = fight.turn_order.get(*turn) {
+                                if *owner == Owner::Player(username) {
+                                    if let TurnType::Movement {player_action, ..} = turn_type {
+                                        *player_action = Some(action);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            Self::DecideAttackAction(action) => {
+                if let Some(username) = data.get_username_by_addr(user) {
+                    if let Some(fight) = &mut data.fight {
+                        if let Some((turn, turn_type)) = &mut fight.current_turn {
+                            if let Some((owner, _, _)) = fight.turn_order.get(*turn) {
+                                if *owner == Owner::Player(username) {
+                                    if let TurnType::Attack {player_action, ..} = turn_type {
+                                        *player_action = Some(action);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CombatAction {
-    Attack(CombatantType),
+    Attack(Combatant),
     RelinquishControl,
 }
 

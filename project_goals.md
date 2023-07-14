@@ -13,18 +13,18 @@
     - Mortal wounds
     - Saving throws
 - Time calculator
-- Possible integration with foundry vtt?
+- ~~Possible integration with foundry vtt?~~ Impossible without way too much work
 - Auto reaction rolls
 - Inventory management
-- Auto level up
+- ~~Auto level up~~
 - ~~Sync server/client without jank~~
-- Proficiency viewer
+- ~~Proficiency viewer~~
 - ~~Enemy viewer (for the dm)~~
-- Spell viewer
+- ~~Spell viewer~~
 - Treasure generator
 - Encounter generator
-- Hextml integration??
-- Dungeon scrawl integration????
+- ~~Hextml integration??~~ Impossible without way too much work
+- ~~Dungeon scrawl integration????~~ Impossible without way too much work
 - Campaign features
     - Magic research
     - Domain play
@@ -54,6 +54,33 @@
 
 ## TODO
 
-- a more modular way of doing class bonuses. maybe defining stat modifiers for every level?
-- Working proficiencies
-    - Find a way to handle generic proficiencies (e.g. Performance(Dance))
+### Features
+- Finish DM-side character sheets *
+- Class damage bonus **
+- Implement cleaves **
+- Figure out spell repertoire and levelling **
+- Create a "party" system. The party stores temporary XP to allocate. ***
+- Implement henchmen. **
+- XP Calculation (stores xp gained, then DM can press button when in town) ***
+- Deployed items/containers. *
+- Probably replace the idea of "deployed" enemies/items with a more general idea of "maps". **
+    - They are not literal maps, but rather a list of "rooms" that have an ID and a list of all the
+    items/enemies in that room. These maps are stored to disk and so are only loaded when they're 
+    actually being used. They might also support random encounters and/or random treasure generation.
+    Rooms could also have descriptions and a list of all connecting rooms, so that the DM can create
+    levels completely without a (normal, spacial) map. 
+    - ~~Maybe use `egui_cable` or `egui_node_graph` for a visual representation of how rooms connect?~~ Sadly, neither work for the time being.
+    - Important question: should the maps store changeable state (like the health of each enemy) or
+    not? If not, where will that state be stored? If so, will there be a way to reset the map to 
+    its initial state? 
+        - Arguments in favor of storing it:
+            - Everything will be persistent between parties and play sessions. 
+            - The entire map is just one file.
+            - It'd probably be easier to understand.
+        - Arguments against storing it:
+            - In order to return the map to its initial state, you'd have to make a copy of it.
+        - I'm gonna go with yes, it should.
+- Custom font/theme *
+
+### Technical
+- ~~Create a generic registry viewer~~ **

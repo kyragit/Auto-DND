@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{dice::{roll, DiceRoll}, class::{Class, SavingThrowProgressionType, HitDie, DivineValue, ArcaneValue}, race::{Race, RaceTable}, combat::{CombatantStats, DamageRoll, StatModifiers, StatusEffects}, item::{Item, ItemType, Encumbrance}, enemy::AttackRoutine, proficiency::{Proficiencies, ProficiencyInstance, PROF_CODE_MAP}};
+use crate::{dice::{roll, DiceRoll}, class::{Class, SavingThrowProgressionType, HitDie, DivineValue, ArcaneValue}, race::{Race, RaceTable}, combat::{CombatantStats, DamageRoll, StatModifiers, StatusEffects}, item::{Item, ItemType, Encumbrance, WeaponDamage, MeleeDamage}, enemy::AttackRoutine, proficiency::{Proficiencies, ProficiencyInstance, PROF_CODE_MAP}};
 use array_macro::array;
 use serde::{Deserialize, Serialize};
 use simple_enum_macro::simple_enum;
@@ -21,6 +21,7 @@ pub struct PlayerCharacter {
     pub divine_spells: Option<DivineSpellcaster>,
     pub arcane_spells: Option<ArcaneSpellcaster>,
     pub notes: String,
+    pub party: Option<String>,
 }
 
 impl PlayerCharacter {
@@ -50,6 +51,7 @@ impl PlayerCharacter {
             divine_spells: None,
             arcane_spells: None,
             notes: String::new(),
+            party: None,
         }
     }
 
@@ -167,8 +169,10 @@ impl PlayerCharacter {
     pub fn add_xp(&mut self, mut amount: u32) {
         amount = (amount as i32 + (amount as f64 * self.combat_stats.modifiers.xp_gain.total()).round() as i32) as u32;
         self.xp += amount;
-        while self.xp >= self.xp_to_level {
+        let mut iterations = 0;
+        while self.xp >= self.xp_to_level && iterations < 15 {
             self.level_up();
+            iterations += 1;
         }
     }
 
@@ -185,6 +189,144 @@ impl PlayerCharacter {
 
     pub fn has_prof(&self, id: impl Into<String>, spec: Option<impl Into<String>>) -> bool {
         self.proficiencies.profs.contains_key(&(id.into(), spec.map(|s| s.into())))
+    }
+
+    pub fn equip_item(&mut self, slot: PlayerEquipSlot, index: usize) {
+        if slot == PlayerEquipSlot::LeftHand || slot == PlayerEquipSlot::BothHands {
+            self.unequip_item(PlayerEquipSlot::LeftHand);
+        }
+        if slot == PlayerEquipSlot::RightHand || slot == PlayerEquipSlot::BothHands {
+            self.unequip_item(PlayerEquipSlot::RightHand);
+        }
+        self.inventory.equip(slot, index);
+        if let Some(item) = self.inventory.get_equip_slot(slot) {
+            if let Some(armor) = item.item_type.armor_stats {
+                if slot == PlayerEquipSlot::Armor {
+                    self.combat_stats.modifiers.armor_class.add("armor", armor as i32);
+                }
+            }
+            if let Some(shield) = item.item_type.shield_stats {
+                if slot == PlayerEquipSlot::LeftHand {
+                    self.combat_stats.modifiers.armor_class.add("shield", shield as i32);
+                }
+            }
+            if let Some(weapon) = &item.item_type.weapon_stats {
+                match &weapon.damage {
+                    WeaponDamage::Melee(melee) => {
+                        match melee {
+                            MeleeDamage::OneHanded(dmg) => {
+                                match slot {
+                                    PlayerEquipSlot::LeftHand => {
+                                        self.combat_stats.modifiers.melee_attack.add("dual_wielding", 1);
+                                    },
+                                    PlayerEquipSlot::RightHand => {
+                                        self.combat_stats.damage = AttackRoutine::One(dmg.clone());
+                                    },
+                                    _ => {},
+                                }
+                            },
+                            MeleeDamage::Versatile(dmg1, dmg2) => {
+                                match slot {
+                                    PlayerEquipSlot::LeftHand => {
+                                        self.combat_stats.modifiers.melee_attack.add("dual_wielding", 1);
+                                    },
+                                    PlayerEquipSlot::RightHand => {
+                                        self.combat_stats.damage = AttackRoutine::One(dmg1.clone());
+                                    },
+                                    PlayerEquipSlot::BothHands => {
+                                        self.combat_stats.damage = AttackRoutine::One(dmg2.clone());
+                                    },
+                                    _ => {},
+                                }
+                            },
+                            MeleeDamage::TwoHanded(dmg) => {
+                                match slot {
+                                    PlayerEquipSlot::BothHands => {
+                                        self.combat_stats.damage = AttackRoutine::One(dmg.clone());
+                                        self.combat_stats.modifiers.initiative.add("heavy_weapon", -1);
+                                    },
+                                    _ => {},
+                                }
+                            },
+                        }
+                    },
+                    WeaponDamage::Missile(dmg, _) => {
+                        match slot {
+                            PlayerEquipSlot::BothHands => {
+                                self.combat_stats.damage = AttackRoutine::One(dmg.clone());
+                            },
+                            _ => {},
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    pub fn unequip_item(&mut self, mut slot: PlayerEquipSlot) {
+        if slot == PlayerEquipSlot::LeftHand || slot == PlayerEquipSlot::RightHand {
+            if let Some(left) = self.inventory.left_hand {
+                if let Some(right) = self.inventory.right_hand {
+                    if left == right {
+                        slot = PlayerEquipSlot::BothHands;
+                    }
+                }
+            }
+        }
+        if let Some(item) = self.inventory.get_equip_slot(slot) {
+            if let Some(_) = item.item_type.armor_stats {
+                if slot == PlayerEquipSlot::Armor {
+                    self.combat_stats.modifiers.armor_class.remove("armor");
+                }
+            }
+            if let Some(_) = item.item_type.shield_stats {
+                if slot == PlayerEquipSlot::LeftHand {
+                    self.combat_stats.modifiers.armor_class.remove("shield");
+                }
+            }
+            if let Some(weapon) = &item.item_type.weapon_stats {
+                match &weapon.damage {
+                    WeaponDamage::Melee(melee) => {
+                        match melee {
+                            MeleeDamage::OneHanded(_) => {
+                                match slot {
+                                    PlayerEquipSlot::LeftHand => {
+                                        self.combat_stats.modifiers.melee_attack.remove("dual_wielding");
+                                    },
+                                    PlayerEquipSlot::RightHand => {
+                                        self.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                    },
+                                    _ => {},
+                                }
+                            },
+                            MeleeDamage::Versatile(_, _) => {
+                                match slot {
+                                    PlayerEquipSlot::LeftHand => {
+                                        self.combat_stats.modifiers.melee_attack.remove("dual_wielding");
+                                    },
+                                    PlayerEquipSlot::RightHand | PlayerEquipSlot::BothHands => {
+                                        self.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                    },
+                                    _ => {},
+                                }
+                            },
+                            MeleeDamage::TwoHanded(_) => {
+                                if slot == PlayerEquipSlot::BothHands {
+                                    self.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                                    self.combat_stats.modifiers.initiative.remove("heavy_weapon");
+                                }
+                            },
+                        }
+                    },
+                    WeaponDamage::Missile(_, _) => {
+                        if slot == PlayerEquipSlot::BothHands {
+                            self.combat_stats.damage = AttackRoutine::One(DamageRoll::default());
+                        }
+                    },
+                }
+            }
+            self.inventory.unequip(slot);
+        }
     }
 }
 
@@ -685,9 +827,25 @@ pub struct DivineSpellcaster {
     pub spell_repertoire: [HashSet<String>; 5],
 }
 
+impl DivineSpellcaster {
+    pub fn restore_all(&mut self) {
+        for (curr, max) in &mut self.spell_slots {
+            *curr = *max;
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ArcaneSpellcaster {
     /// form is [(current, maximum); spell_level]
     pub spell_slots: [(u32, u32); 6],
     pub spell_repertoire: [(HashSet<String>, u32); 6],
+}
+
+impl ArcaneSpellcaster {
+    pub fn restore_all(&mut self) {
+        for (curr, max) in &mut self.spell_slots {
+            *curr = *max;
+        }
+    }
 }

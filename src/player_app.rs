@@ -1,20 +1,23 @@
+use crate::party::Party;
 use crate::{AppPreferences, WindowPreferences};
 use crate::character::{PlayerCharacter, Attr, PlayerEquipSlot};
 use crate::class::{Class, ClassDamageBonus, Cleaves, DivineValue, ArcaneValue};
-use crate::combat::{CombatantType, SavingThrowType};
-use crate::common_ui::{CharacterSheetTab, self, back_arrow};
+use crate::combat::{Combatant, SavingThrowType, MovementAction, AttackAction, PreRoundAction, SpecialManeuver};
+use crate::common_ui::{CharacterSheetTab, self, back_arrow, TabCallbackMode, ChatMessage, link_button};
 use crate::dm_app::{Registry, RegistryNode};
 use crate::item::{WeaponDamage, MeleeDamage, ContainerStats};
 use crate::proficiency::Proficiency;
 use crate::spell::{Spell, SpellRegistry, MagicType};
-use displaydoc::Display;
 use eframe::egui::{self, RichText, Ui, WidgetText};
 use eframe::epaint::{Rgba, Color32};
-use egui_dock::{TabViewer, Tree, DockArea};
+use egui::text::LayoutJob;
+use egui_dock::{TabViewer, Tree, DockArea, TabDestination, TabIndex};
 use egui_extras::{StripBuilder, Size};
+use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
-use crate::packets::{ClientBoundPacket, ServerBoundPacket, CombatAction, ClientFacingError, Request};
-use std::collections::HashMap;
+use thousands::Separable;
+use crate::packets::{ClientBoundPacket, ServerBoundPacket, ClientFacingError, Request};
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 use std::io::{prelude::*, ErrorKind};
 use std::sync::{Arc, Mutex};
@@ -64,8 +67,9 @@ pub struct PlayerAppData {
     pub ip_address: String,
     pub show_error: bool,
     pub stream: Option<TcpStream>,
+    pub buffered_packet: Vec<u8>,
     pub logged_in: bool,
-    pub logs: Vec<String>,
+    pub logs: Vec<LayoutJob>,
     pub chat_box: String,
     pub unread_messages: u32,
     pub unread_msg_buffer: bool,
@@ -89,11 +93,12 @@ pub struct PlayerAppData {
     pub new_characters: Vec<PlayerCharacter>,
     pub picked_character: Option<usize>,
     pub new_char_name_error: Option<ClientFacingError>,
-    pub character_awaiting_action: Option<CombatantType>,
-    pub combatant_list: Vec<CombatantType>,
-    pub selected_target: usize,
     pub prefs: WindowPreferences,
     pub requests: Requests,
+    pub combat_state: Option<CombatState>,
+    pub combat_just_started: bool,
+    pub parties: HashMap<String, Party>,
+    pub temp_party: (String, Color32),
 }
 
 impl PlayerAppData {
@@ -103,6 +108,7 @@ impl PlayerAppData {
             ip_address: String::new(),
             show_error: false,
             stream: None,
+            buffered_packet: Vec::new(),
             logged_in: false,
             logs: Vec::new(),
             chat_box: String::new(),
@@ -128,11 +134,12 @@ impl PlayerAppData {
             new_characters: Vec::new(),
             picked_character: None,
             new_char_name_error: None,
-            character_awaiting_action: None,
-            combatant_list: Vec::new(),
-            selected_target: 0,
             prefs: WindowPreferences::new(),
             requests: Requests::new(),
+            combat_state: None,
+            combat_just_started: false,
+            parties: HashMap::new(),
+            temp_party: (String::new(), Color32::WHITE),
         }
     }
 
@@ -181,7 +188,7 @@ impl PlayerApp {
         }
     }
 
-    pub fn chat_window(ctx: &egui::Context, data: &mut PlayerAppData, tree: &mut Tree<PlayerTab>) {
+    fn chat_window(ctx: &egui::Context, data: &mut PlayerAppData, tree: &mut Tree<PlayerTab>) {
         let open = data.window_states.entry("chat_window".to_owned()).or_insert(false);
         let prev_open = open.clone();
         let mut temp_open = open.clone();
@@ -203,7 +210,7 @@ impl PlayerApp {
         data.window_states.insert("chat_window".to_owned(), temp_open);
     }
 
-    pub fn connect_screen(ctx: &egui::Context, data: &mut PlayerAppData) -> bool {
+    fn connect_screen(ctx: &egui::Context, data: &mut PlayerAppData) -> bool {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() / 2.0) - 65.0);
@@ -227,7 +234,7 @@ impl PlayerApp {
         }).inner
     }
 
-    pub fn log_in_screen(ctx: &egui::Context, data: &mut PlayerAppData) {
+    fn log_in_screen(ctx: &egui::Context, data: &mut PlayerAppData) {
         egui::CentralPanel::default().show(ctx, |ui| {
             StripBuilder::new(ui)
                 .size(Size::remainder())
@@ -268,26 +275,60 @@ impl PlayerApp {
         });
     }
 
-    fn combat_action_window(ctx: &egui::Context, data: &mut PlayerAppData) {
-        if *data.window_states.entry("combat_action".to_owned()).or_insert(false) {
-            egui::Window::new("Combat Action")
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(format!("Character: {}", data.character_awaiting_action.as_ref().map_or("error".to_owned(), |n| n.name())));
-                    egui::ComboBox::from_label("Target")
-                        .show_index(ui, &mut data.selected_target, data.combatant_list.len(), |i| data.combatant_list.get(i).map_or("error".to_owned(), |c| c.name()));
-                if ui.button("Attack").clicked() {
-                    if let Some(target) = data.combatant_list.get(data.selected_target) {
-                        data.send_to_server(ServerBoundPacket::DecideCombatAction(CombatAction::Attack(target.clone())));
-                    } else {
-                        data.send_to_server(ServerBoundPacket::DecideCombatAction(CombatAction::RelinquishControl));
-                    }
-                    data.window_states.insert("combat_action".to_owned(), false);
-                }
-                });
-            });
+    fn open_or_focus(tree: &mut Tree<PlayerTab>, tab: PlayerTab) {
+        if let Some((node_i, tab_i)) = tree.find_tab(&tab) {
+            tree.set_active_tab(node_i, tab_i);
+            tree.set_focused_node(node_i);
+        } else {
+            tree.push_to_focused_leaf(tab);
         }
+    }
+
+    fn top_bar(ui: &mut Ui, data: &mut PlayerAppData, tree: &mut Tree<PlayerTab>) {
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("Characters", |ui| {
+                for (name, _) in &data.characters {
+                    if ui.button(name).clicked() {
+                        Self::open_or_focus(tree, PlayerTab::Character(name.clone()));
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.button("Character Generator").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::CharacterGenerator);
+                    ui.close_menu();
+                }
+                if ui.button("Character List").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::Characters);
+                    ui.close_menu();
+                }
+                if ui.button("Chat").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::Chat);
+                    ui.close_menu();
+                }
+                if ui.button("Classes").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::ClassViewer);
+                    ui.close_menu();
+                }
+                if ui.button("Combat").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::Combat);
+                    ui.close_menu();
+                }
+                if ui.button("Notes").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::Notes);
+                    ui.close_menu();
+                }
+                if ui.button("Proficiencies").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::ProficiencyViewer);
+                    ui.close_menu();
+                }
+                if ui.button("Spells").clicked() {
+                    Self::open_or_focus(tree, PlayerTab::SpellViewer);
+                    ui.close_menu();
+                }
+            });
+        });
     }
 }
 
@@ -296,12 +337,12 @@ pub fn chat(ui: &mut Ui, data: &mut PlayerAppData) {
         let response = ui.text_edit_singleline(&mut data.chat_box);
         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
             if !data.chat_box.trim().is_empty() {
-                data.send_to_server(ServerBoundPacket::ChatMessage(data.chat_box.clone()));  
+                data.send_to_server(ServerBoundPacket::ChatMessage(ChatMessage::player(data.username.clone(), data.chat_box.clone())));  
             }
             data.chat_box.clear();
         }
-        for (i, log) in (&data.logs).into_iter().enumerate() {
-            ui.label(log);
+        for (i, log) in data.logs.iter().enumerate() {
+            ui.label(log.clone());
             if i == 0 {
                 ui.separator();
             }
@@ -309,12 +350,12 @@ pub fn chat(ui: &mut Ui, data: &mut PlayerAppData) {
     });
 }
 
-pub struct PlayerTabViewer<'a, F: FnMut(PlayerTab, bool)> {
+pub struct PlayerTabViewer<'a, F: FnMut(PlayerTab, TabCallbackMode)> {
     pub callback: &'a mut F,
     pub data: &'a mut PlayerAppData,
 }
 
-impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
+impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
     fn character_sheet(&mut self, ui: &mut Ui, name: &String) {
         let data = &mut *self.data;
         let mut packets = Vec::new();
@@ -328,6 +369,18 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
             }, |ui, tab| {
                 match tab {
                     CharacterSheetTab::Stats => {
+                        if let Some(party_name) = &sheet.party {
+                            ui.horizontal(|ui| {
+                                ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+                                ui.label("Member of ");
+                                if let Some(party) = data.parties.get(party_name) {
+                                    ui.colored_label(party.color, party_name);
+                                } else {
+                                    ui.colored_label(Color32::RED, format!("{}ERROR: Nonexistent party!{}", ep::WARNING, ep::WARNING));
+                                }
+                            });
+                            ui.separator();
+                        }
                         let attrs = sheet.combat_stats.attributes;
                         ui.label(format!("STR: {} ({:+})", attrs.strength, attrs.modifier(Attr::STR)))
                             .on_hover_text("Strength represents brute force and muscle mass. It modifies your melee attack and damage rolls, as well as acts of brute force (such as breaking open a door).");
@@ -417,11 +470,17 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                         ui.label(format!("Title: {}", sheet.title));
                         ui.label(format!("Race: {}", sheet.race));
                         ui.label(format!("Level: {}", sheet.level));
-                        ui.label(format!("XP: {}/{} ({:+.1}%)", sheet.xp, sheet.xp_to_level, sheet.combat_stats.modifiers.xp_gain.total() * 100.0));
+                        ui.label(format!("XP: {}/{} ({:+.1}%)", sheet.xp.separate_with_commas(), if sheet.level >= sheet.class.maximum_level {ep::INFINITY.to_owned()} else {sheet.xp_to_level.separate_with_commas()}, sheet.combat_stats.modifiers.xp_gain.total() * 100.0));
                         ui.label(format!("Hit Die: {}", sheet.class.hit_die))
                             .on_hover_text("Your hit die is rolled whenever you level up to determine the amount of HP you gain.");
                     },
                     CharacterSheetTab::Inventory => {
+                        if let Some(state) = &data.combat_state {
+                            if state.your_combatants.contains_key(&Combatant::PC(data.username.clone(), name.clone())) {
+                                ui.colored_label(Color32::LIGHT_RED, "This character is in combat. A combat action is required to change your inventory in most circumstances. Ask the DM if what you're doing is allowed.");
+                                ui.separator();
+                            }
+                        }
                         sheet.inventory.foreach_enumerate(|i, item| {
                             ui.horizontal(|ui| {
                                 let response = ui.add(egui::Label::new(format!("{} x{}", item.item_type.name, item.count)).sense(egui::Sense::click()));
@@ -648,7 +707,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                     ui.add_space(5.0);
                                     if ui.small_button(format!("{}", egui_phosphor::ARROW_SQUARE_OUT)).clicked() {
                                         data.viewed_prof = Some(id.clone());
-                                        (self.callback)(PlayerTab::ProficiencyViewer, true);
+                                        (self.callback)(PlayerTab::ProficiencyViewer, TabCallbackMode::AddOrFocus);
                                     }
                                 });
                             }
@@ -667,9 +726,9 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                                     ui.label(format!("Level {}:", i + 1));
                                                     for j in 0..max {
                                                         if curr > j {
-                                                            ui.colored_label(Color32::GREEN, format!("{}", egui_phosphor::STAR));
+                                                            ui.colored_label(Color32::GREEN, format!("{}", ep::STAR));
                                                         } else {
-                                                            ui.colored_label(Color32::RED, format!("{}", egui_phosphor::STAR_HALF));
+                                                            ui.colored_label(Color32::RED, format!("{}", ep::STAR_HALF));
                                                         }
                                                     }
                                                     ui.label(RichText::new(format!("{}/{}", curr, max)).weak());
@@ -684,9 +743,19 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                                         if let Some(spell) = data.spell_registry.divine[i].get(spell_id) {
                                                             ui.horizontal(|ui| {
                                                                 ui.label(&spell.name);
-                                                                if ui.small_button(format!("{}", egui_phosphor::ARROW_SQUARE_OUT)).clicked() {
+                                                                if link_button(ui) {
                                                                     data.viewed_spell = Some((spell.magic_type, Some((spell.spell_level, Some(spell_id.clone())))));
-                                                                    (self.callback)(PlayerTab::SpellViewer, true);
+                                                                    (self.callback)(PlayerTab::SpellViewer, TabCallbackMode::AddOrFocus);
+                                                                }
+                                                                if let Some(state) = &data.combat_state {
+                                                                    if state.round_state == CombatRoundState::PreRound {
+                                                                        if state.your_combatants.contains_key(&Combatant::PC(data.username.clone(), name.clone())) {
+                                                                            if ui.button("Declare").clicked() {
+                                                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(Combatant::PC(data.username.clone(), name.clone()), PreRoundAction::CastSpell(spell_id.clone(), i as u8, MagicType::Divine)));
+                                                                                (self.callback)(PlayerTab::Combat, TabCallbackMode::AddOrFocus);
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
                                                             });       
                                                         }
@@ -712,9 +781,9 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                                     ui.label(format!("Level {}:", i + 1));
                                                     for j in 0..max {
                                                         if curr > j {
-                                                            ui.colored_label(Color32::GREEN, format!("{}", egui_phosphor::STAR));
+                                                            ui.colored_label(Color32::GREEN, format!("{}", ep::STAR));
                                                         } else {
-                                                            ui.colored_label(Color32::RED, format!("{}", egui_phosphor::STAR_HALF));
+                                                            ui.colored_label(Color32::RED, format!("{}", ep::STAR_HALF));
                                                         }
                                                     }
                                                     ui.label(RichText::new(format!("{}/{}", curr, max)).weak());
@@ -724,15 +793,25 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                                 .id_source(format!("{}_arcane_spells_{}", name, i))
                                                 .show_unindented(ui, |ui| {
                                                     show_slots(ui);
-                                                    ui.separator();
                                                     ui.label(format!("Repertoire size: {}/{}", arcane.spell_repertoire[i].0.len(),  arcane.spell_repertoire[i].1));
+                                                    ui.separator();
                                                     for spell_id in &arcane.spell_repertoire[i].0 {
                                                         if let Some(spell) = data.spell_registry.arcane[i].get(spell_id) {
                                                             ui.horizontal(|ui| {
                                                                 ui.label(&spell.name);
-                                                                if ui.small_button(format!("{}", egui_phosphor::ARROW_SQUARE_OUT)).clicked() {
+                                                                if link_button(ui) {
                                                                     data.viewed_spell = Some((spell.magic_type, Some((spell.spell_level, Some(spell_id.clone())))));
-                                                                    (self.callback)(PlayerTab::SpellViewer, true);
+                                                                    (self.callback)(PlayerTab::SpellViewer, TabCallbackMode::AddOrFocus);
+                                                                }
+                                                                if let Some(state) = &data.combat_state {
+                                                                    if state.round_state == CombatRoundState::PreRound {
+                                                                        if state.your_combatants.contains_key(&Combatant::PC(data.username.clone(), name.clone())) {
+                                                                            if ui.button("Declare").clicked() {
+                                                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(Combatant::PC(data.username.clone(), name.clone()), PreRoundAction::CastSpell(spell_id.clone(), i as u8, MagicType::Arcane)));
+                                                                                (self.callback)(PlayerTab::Combat, TabCallbackMode::AddOrFocus);
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
                                                             });       
                                                         }
@@ -753,7 +832,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                         }
                     },
                     CharacterSheetTab::Notes => {
-                        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                        ui.centered_and_justified(|ui| {
                             if ui.text_edit_multiline(&mut sheet.notes).lost_focus() {
                                 packets.push(ServerBoundPacket::RequestCharacterUpdate(name.clone(), Some(sheet.clone())));
                             }
@@ -789,7 +868,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                             if ui.button("Pick!").clicked() {
                                                 data.new_char_class = Some(class.clone());
                                                 go_back = true;
-                                                (self.callback)(PlayerTab::ClassViewer, false);
+                                                (self.callback)(PlayerTab::ClassViewer, TabCallbackMode::Remove);
                                             }
                                         }
                                     });
@@ -1079,7 +1158,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                                     packets.push(ServerBoundPacket::PickNewProficiency(character.clone(), *general, id.clone(), data.viewed_prof_spec.clone()));
                                     data.picking_prof = None;
                                     data.viewed_prof_spec = None;
-                                    (self.callback)(PlayerTab::ProficiencyViewer, false);
+                                    (self.callback)(PlayerTab::ProficiencyViewer, TabCallbackMode::Remove);
                                 }
                             }
                         }
@@ -1325,7 +1404,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
                         ui.label(format!("CHA: {}", sheet.combat_stats.attributes.charisma));
                         if ui.button("Pick").clicked() {
                             picked = Some(i);
-                            (self.callback)(PlayerTab::ClassViewer, true);
+                            (self.callback)(PlayerTab::ClassViewer, TabCallbackMode::AddOrMove);
                         }
                     });
                     if i < data.new_characters.len() - 1 {
@@ -1338,55 +1417,203 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> PlayerTabViewer<'a, F> {
             });
         }  
     }
+    fn combat(&mut self, ui: &mut Ui) {
+        let data = &mut *self.data;
+        let mut packets = Vec::new();
+        if let Some(state) = &mut data.combat_state {
+            match &mut state.round_state {
+                CombatRoundState::PreRound => {
+                    ui.label("Initiative has not been calculated yet. You may declare intent to perform defensive movement or cast a spell.");
+                    for (combatant, declared) in &state.your_combatants {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}", combatant));
+                            if *declared != PreRoundAction::None {
+                                match declared {
+                                    PreRoundAction::CastSpell(id, lvl, mt) => {
+                                        ui.label(format!("(Cast Spell: {})", data.spell_registry.get_spell_name_or_default(id, *lvl, *mt)));
+                                        if link_button(ui) {
+                                            data.viewed_spell = Some((*mt, Some((*lvl, Some(id.clone())))));
+                                            (self.callback)(PlayerTab::SpellViewer, TabCallbackMode::AddOrFocus);
+                                        }
+                                    },
+                                    _ => {
+                                        ui.label(format!("({})", declared));
+                                    }
+                                }
+                                if ui.small_button(RichText::new(format!("{}", ep::X)).color(Color32::RED)).clicked() {
+                                    packets.push(ServerBoundPacket::MakePreRoundDeclaration(combatant.clone(), PreRoundAction::None));
+                                }
+                            } else {
+                                ui.menu_button("Declare", |ui| {
+                                    match combatant {
+                                        Combatant::PC(_, name) => {
+                                            if ui.button("Cast Spell").clicked() {
+                                                data.character_window_tab_state.insert(name.clone(), CharacterSheetTab::Spells);
+                                                (self.callback)(PlayerTab::Character(name.clone()), TabCallbackMode::AddOrFocus);
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Fighting Withdrawal").clicked() {
+                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(combatant.clone(), PreRoundAction::FightingWithdrawal));
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Full Retreat").clicked() {
+                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(combatant.clone(), PreRoundAction::FullRetreat));
+                                                ui.close_menu();
+                                            }
+                                        },
+                                        Combatant::Enemy(_, _, _) => {
+    
+                                        },
+                                    }
+                                });
+                            }
+                        });
+                    }
+                },
+                CombatRoundState::NotYourTurn => {
+                    ui.label("It is not your turn to act.");
+                },
+                CombatRoundState::MovementAction 
+                { combatant, waiting_for_approval, temp_action } => {
+                    ui.label(format!("It is {}'s turn.", combatant));
+                    if let Some(declared) = state.your_combatants.get(combatant) {
+                        match declared {
+                            PreRoundAction::CastSpell(id, lvl, mt) => {
+                                ui.label(format!("Remember, you declared you were going cast {}.", data.spell_registry.get_spell_name_or_default(id, *lvl, *mt)));
+                            },
+                            PreRoundAction::None => {},
+                            d => {
+                                ui.label(format!("Remember, you declared you were going to {}.", d));
+                            },
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if *waiting_for_approval {
+                        ui.label("Waiting for the DM...");
+                    } else {
+                        egui::ComboBox::from_label("Movement Action")
+                            .selected_text(temp_action.to_string())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(temp_action, MovementAction::None, "None");
+                                ui.selectable_value(temp_action, MovementAction::Move, "Move");
+                                ui.selectable_value(temp_action, MovementAction::Run, "Run");
+                                ui.selectable_value(temp_action, MovementAction::Charge, "Charge");
+                                ui.selectable_value(temp_action, MovementAction::FightingWithdrawal, "Fighting Withdrawal");
+                                ui.selectable_value(temp_action, MovementAction::FullRetreat, "Full Retreat");
+                                ui.selectable_value(temp_action, MovementAction::SimpleAction, "Simple Action");
+                            });
+                        if ui.button("Act").clicked() {
+                            *waiting_for_approval = true;
+                            packets.push(ServerBoundPacket::DecideMovementAction(temp_action.clone()));
+                        }
+                    }
+                },
+                CombatRoundState::AttackAction 
+                { combatant, waiting_for_approval, temp_action } => {
+                    ui.label(format!("It is {}'s turn.", combatant));
+                    if let Some(declared) = state.your_combatants.get(combatant) {
+                        match declared {
+                            PreRoundAction::CastSpell(id, lvl, mt) => {
+                                ui.label(format!("Remember, you declared you were going cast {}.", data.spell_registry.get_spell_name_or_default(id, *lvl, *mt)));
+                            },
+                            PreRoundAction::None => {},
+                            d => {
+                                ui.label(format!("Remember, you declared you were going to {}.", d));
+                            },
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if *waiting_for_approval {
+                        ui.label("Waiting for the DM...");
+                    } else {
+                        egui::ComboBox::from_label("Attack Action")
+                            .selected_text(temp_action.to_string())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(temp_action, AttackAction::None, "None");
+                                ui.selectable_value(temp_action, AttackAction::Attack(state.valid_targets.iter().next().cloned().unwrap_or(Combatant::not_found()), 0), "Attack");
+                                ui.selectable_value(temp_action, AttackAction::SpecialManeuver(state.valid_targets.iter().next().cloned().unwrap_or(Combatant::not_found()), SpecialManeuver::Disarm, 0), "Special Maneuver");
+                                ui.selectable_value(temp_action, AttackAction::CastSpell, "Cast Spell");
+                                ui.selectable_value(temp_action, AttackAction::OtherAction, "Other Action");
+                            });
+                        match temp_action {
+                            AttackAction::Attack(target, _) => {
+                                egui::ComboBox::from_label("Target")
+                                    .selected_text(target.name())
+                                    .show_ui(ui, |ui| {
+                                        for t in &state.valid_targets {
+                                            ui.selectable_value(target, t.clone(), t.name());
+                                        }
+                                    });
+                            },
+                            AttackAction::SpecialManeuver(target, maneuver, _) => {
+                                egui::ComboBox::from_label("Target")
+                                    .selected_text(target.name())
+                                    .show_ui(ui, |ui| {
+                                        for t in &state.valid_targets {
+                                            ui.selectable_value(target, t.clone(), t.name());
+                                        }
+                                    });
+                                egui::ComboBox::from_label("Maneuver")
+                                    .selected_text(maneuver.to_string())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(maneuver, SpecialManeuver::Disarm, "Disarm");
+                                        ui.selectable_value(maneuver, SpecialManeuver::ForceBack, "Force Back");
+                                        ui.selectable_value(maneuver, SpecialManeuver::Incapacitate, "Incapacitate");
+                                        ui.selectable_value(maneuver, SpecialManeuver::KnockDown, "Knock Down");
+                                        ui.selectable_value(maneuver, SpecialManeuver::Sunder, "Sunder");
+                                        ui.selectable_value(maneuver, SpecialManeuver::Wrestle, "Wrestle");
+                                    });
+                            },
+                            _ => {},
+                        }
+                        if ui.button("Act").clicked() {
+                            *waiting_for_approval = true;
+                            packets.push(ServerBoundPacket::DecideAttackAction(temp_action.clone()));
+                        }
+                    }
+                },
+            }
+        } else {
+            ui.label("None of your characters are currently in combat.");
+        }
+        for packet in packets {
+            data.send_to_server(packet);
+        }
+    }
 }
 
-impl<'a, F: FnMut(PlayerTab, bool) + 'a> TabViewer for PlayerTabViewer<'a, F> {
-    type Tab = PlayerTab;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CombatState {
+    pub your_combatants: HashMap<Combatant, PreRoundAction>,
+    pub valid_targets: HashSet<Combatant>,
+    pub round_state: CombatRoundState,
+}
 
-    fn add_popup(&mut self, ui: &mut Ui, _node: egui_dock::NodeIndex) {
-        ui.horizontal(|ui| {
-            if ui.button("Chat").clicked() {
-                (self.callback)(PlayerTab::Chat, true);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Notes").clicked() {
-                (self.callback)(PlayerTab::Notes, true);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Characters").clicked() {
-                (self.callback)(PlayerTab::Characters, true);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Character Generator").clicked() {
-                (self.callback)(PlayerTab::CharacterGenerator, true);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Class Viewer").clicked() {
-                (self.callback)(PlayerTab::ClassViewer, true);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Proficiency Viewer").clicked() {
-                (self.callback)(PlayerTab::ProficiencyViewer, true);
-            }
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Spell Viewer").clicked() {
-                (self.callback)(PlayerTab::SpellViewer, true);
-            }
-        });
-    }
+#[simple_enum(no_copy)]
+pub enum CombatRoundState {
+    PreRound,
+    NotYourTurn,
+    MovementAction {
+        combatant: Combatant,
+        waiting_for_approval: bool,
+        temp_action: MovementAction,
+    },
+    AttackAction {
+        combatant: Combatant,
+        waiting_for_approval: bool,
+        temp_action: AttackAction,
+    },
+}
+
+impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> TabViewer for PlayerTabViewer<'a, F> {
+    type Tab = PlayerTab;
 
     fn context_menu(&mut self, ui: &mut Ui, tab: &mut Self::Tab) {
         match tab {
             PlayerTab::Chat => {
                 if ui.button("Detatch").clicked() {
                     self.data.window_states.insert("chat_window".to_owned(), true);
-                    (self.callback)(PlayerTab::Chat, false);
+                    (self.callback)(PlayerTab::Chat, TabCallbackMode::Remove);
                     ui.close_menu();
                 }
             },
@@ -1401,7 +1628,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> TabViewer for PlayerTabViewer<'a, F> {
                 chat(ui, self.data);
             },
             PlayerTab::Notes => {
-                ui.vertical_centered_justified(|ui| {
+                ui.centered_and_justified(|ui| {
                     if ui.text_edit_multiline(&mut self.data.notes).lost_focus() {
                         self.data.send_to_server(ServerBoundPacket::UpdatePlayerNotes(self.data.notes.clone()));
                     }
@@ -1411,7 +1638,7 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> TabViewer for PlayerTabViewer<'a, F> {
                 ui.vertical(|ui| {
                     for (name, _) in &self.data.characters {
                         if ui.button(format!("View: {}", name)).clicked() {
-                            (self.callback)(PlayerTab::Character(name.clone()), true);
+                            (self.callback)(PlayerTab::Character(name.clone()), TabCallbackMode::AddOrFocus);
                         }
                     }
                 });
@@ -1431,19 +1658,31 @@ impl<'a, F: FnMut(PlayerTab, bool) + 'a> TabViewer for PlayerTabViewer<'a, F> {
             PlayerTab::CharacterGenerator => {
                 self.character_generator(ui);
             },
+            PlayerTab::Combat => {
+                self.combat(ui);
+            },
         }
     }
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        if *tab == PlayerTab::Chat {
-            self.data.get_chat_title()
-        } else {
-            tab.to_string().into()
+        match tab {
+            PlayerTab::Chat => {
+                self.data.get_chat_title()
+            },
+            PlayerTab::Combat => {
+                ep::SWORD.into()
+            },
+            PlayerTab::Notes => {
+                ep::NOTE.into()
+            },
+            _ => {
+                tab.to_string().into()
+            },
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Display)]
+#[simple_enum(display, no_copy)]
 pub enum PlayerTab {
     /// Chat
     Chat,
@@ -1461,6 +1700,8 @@ pub enum PlayerTab {
     ProficiencyViewer,
     /// Spell Viewer
     SpellViewer,
+    /// Combat
+    Combat,
 }
 
 impl eframe::App for PlayerApp {
@@ -1502,42 +1743,60 @@ impl eframe::App for PlayerApp {
             return;
         }
         Self::chat_window(ctx, data, &mut self.tree);
-        Self::combat_action_window(ctx, data);
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.vertical(|ui| {
+                ui.add_space(3.0);
+                Self::top_bar(ui, data, &mut self.tree);
+                ui.add_space(2.0);
+            });
+        });
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.tree.is_empty() {
+            if self.tree.is_empty() && !data.combat_just_started {
                 ui.vertical_centered(|ui| {
                     ui.add_space((ui.available_height() / 2.0) - 10.0);
-                    if ui.add(egui::Button::new("Oh no, you closed the last tab! Click me to get one back.").frame(false)).clicked() {
-                        self.tree.push_to_first_leaf(PlayerTab::Chat);
-                    }
+                    ui.label(RichText::new("There's nothing here...").weak().italics());
                 });
             } else {
-                let mut new_tab = None;
-                let mut remove_tab = None;
+                let mut callbacks: Vec<(PlayerTab, TabCallbackMode)> = Vec::new();
                 DockArea::new(&mut self.tree)
-                    .show_add_buttons(true)
-                    .show_add_popup(true)
                     .show_inside(ui, &mut PlayerTabViewer {
-                        callback: &mut |tab, add| {
-                            if add {
-                                new_tab = Some(tab);
-                            } else {
-                                remove_tab = Some(tab);
-                            }
+                        callback: &mut |tab, mode| {
+                            callbacks.push((tab, mode));
                         },
                         data,
                     });
-                if let Some(tab) = new_tab {
-                    if let Some((node_i, tab_i)) = self.tree.find_tab(&tab) {
-                        self.tree.set_focused_node(node_i);
-                        self.tree.set_active_tab(node_i, tab_i);
-                    } else {
-                        self.tree.push_to_focused_leaf(tab);
-                    }
+                if data.combat_just_started {
+                    callbacks.push((PlayerTab::Combat, TabCallbackMode::AddOrFocus));
+                    data.combat_just_started = false;
                 }
-                if let Some(tab) = remove_tab {
-                    if let Some(i) = self.tree.find_tab(&tab) {
-                        self.tree.remove_tab(i);
+                for (tab, mode) in callbacks {
+                    match mode {
+                        TabCallbackMode::AddOrFocus => {
+                            if let Some((node_i, tab_i)) = self.tree.find_tab(&tab) {
+                                self.tree.set_focused_node(node_i);
+                                self.tree.set_active_tab(node_i, tab_i);
+                            } else {
+                                self.tree.push_to_focused_leaf(tab);
+                            }
+                        },
+                        TabCallbackMode::AddOrMove => {
+                            if let Some((node_i, tab_i)) = self.tree.find_tab(&tab) {
+                                if let Some(curr) = self.tree.focused_leaf() {
+                                    self.tree.move_tab((node_i, tab_i), (curr, TabDestination::Insert(TabIndex(0))));
+                                    self.tree.set_active_tab(curr, TabIndex(0));
+                                } else {
+                                    self.tree.set_focused_node(node_i);
+                                    self.tree.set_active_tab(node_i, tab_i);
+                                }
+                            } else {
+                                self.tree.push_to_focused_leaf(tab);
+                            }
+                        },
+                        TabCallbackMode::Remove => {
+                            if let Some(i) = self.tree.find_tab(&tab) {
+                                self.tree.remove_tab(i);
+                            }
+                        },
                     }
                 }
             }
@@ -1556,19 +1815,20 @@ impl eframe::App for PlayerApp {
     }
 }
 
-pub fn handle_packets(data: Arc<Mutex<PlayerAppData>>) {
+fn handle_packets(data: Arc<Mutex<PlayerAppData>>) {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(CLIENT_UPDATE_CLOCK));
         let data = &mut *data.lock().unwrap();
         if let Some(stream) = &mut data.stream {
             let mut reader = std::io::BufReader::new(stream);
-            let recieved: Vec<u8>;
+            let mut recieved: Vec<u8> = Vec::new();
+            recieved.append(&mut data.buffered_packet);
             match reader.fill_buf() {
                 Ok(buf) => {
                     if buf.is_empty() {
                         continue;
                     }
-                    recieved = buf.to_vec();
+                    recieved.append(&mut buf.to_vec());
                 },
                 Err(e) => {
                     match e.kind() {
@@ -1580,12 +1840,28 @@ pub fn handle_packets(data: Arc<Mutex<PlayerAppData>>) {
                     }
                 },
             }
-            reader.consume(recieved.len());
-            for split in recieved.split(|byte| *byte == 255) {
-                let msg = String::from_utf8(split.to_vec()).unwrap_or(String::new());
-                if let Ok(packet) = ron::from_str::<ClientBoundPacket>(msg.as_str()) {
-                    packet.handle(data);
+            
+            let mut packets = Vec::new();
+            let mut iter = recieved.split_inclusive(|b| *b == 255);
+            while let Some(bytes) = iter.next() {
+                if bytes.ends_with(&[255]) {
+                    reader.consume(bytes.len());
+                    if bytes.len() < 2 {
+                        continue;
+                    }
+                    let msg = String::from_utf8_lossy(&bytes[..bytes.len() - 1]);
+                    match ron::from_str::<ClientBoundPacket>(&*msg) {
+                        Ok(packet) => {
+                            packets.push(packet);
+                        },
+                        Err(_) => {},
+                    }
+                } else {
+                    data.buffered_packet = bytes.to_vec();
                 }
+            }
+            for packet in packets {
+                packet.handle(data);
             }
         } else {
             break;

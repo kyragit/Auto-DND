@@ -132,4 +132,13 @@ impl SpellRegistry {
             None
         }
     }
+    pub fn get_spell_name_or<'a>(&'a self, id: impl Into<String>, lvl: u8, magic_type: MagicType, default: &'a str) -> &'a str {
+        match magic_type {
+            MagicType::Divine => self.divine.get(lvl as usize),
+            MagicType::Arcane => self.arcane.get(lvl as usize),
+        }.and_then(|map| map.get(&id.into()).map(|s| s.name.as_str())).unwrap_or(default)
+    }
+    pub fn get_spell_name_or_default<'a>(&'a self, id: impl Into<String>, lvl: u8, magic_type: MagicType) -> &'a str {
+        self.get_spell_name_or(id, lvl, magic_type, "Nonexistent Spell")
+    }
 }

@@ -3,7 +3,7 @@ use std::{collections::{HashMap, hash_map::Iter, HashSet}, ops::{AddAssign, SubA
 use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
 
-use crate::{character::{Attributes, Health, SavingThrows}, dm_app::DMAppData, packets::{ClientBoundPacket, CombatAction}, dice::{self, DiceRoll}, enemy::AttackRoutine};
+use crate::{character::{Attributes, Health, SavingThrows}, dm_app::DMAppData, packets::{ClientBoundPacket}, dice::{self, DiceRoll}, enemy::AttackRoutine, common_ui::ChatMessage, spell::MagicType, player_app::{CombatRoundState, CombatState}};
 
 /// All the stats required for something to engage in combat. All of these are *base* stats, before
 /// any modifiers! This means `armor_class` will be zero for most characters, unless they have 
@@ -98,6 +98,18 @@ impl CombatantStats {
         };
         let nat = DiceRoll::simple(1, 20).roll();
         nat >= 20 || nat + modifier >= 20
+    }
+
+    pub fn hurt(&mut self, damage: u32) -> bool {
+        let before = self.health.current_hp;
+        self.health.current_hp -= damage as i32;
+        let after = self.health.current_hp;
+        if before > 0 && after <= 0 {
+            self.status_effects.effects.insert(StatusEffect::Dying);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -253,6 +265,34 @@ impl DamageRoll {
     }
 }
 
+#[simple_enum(display)]
+pub enum StatModType {
+    /// Melee Attack
+    MeleeAttack,
+    /// Missile Attack
+    MissileAttack,
+    /// Melee Damage
+    MeleeDamage,
+    /// Missile Damage
+    MissileDamage,
+    /// Initiative
+    Initiative,
+    /// Surprise
+    Surprise,
+    /// Armor Class
+    ArmorClass,
+    /// Save (Petrification & Paralysis)
+    SavePP,
+    /// Save (Poison & Death)
+    SavePD,
+    /// Save (Blast & Breath)
+    SaveBB,
+    /// Save (Staffs & Wands)
+    SaveSW,
+    /// Save (Spells)
+    SaveSpells,
+}
+
 /// Stores ALL active modifiers for every stat, including permanent and temporary modifiers. Each
 /// modifier needs a unique key that specifies where it came from (proficiencies, class bonuses, etc).
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -306,12 +346,33 @@ impl StatModifiers {
         self.save_staffs_wands.remove(key.clone());
         self.save_spells.remove(key);
     }
+
+    pub fn get_i32(&mut self, typ: StatModType) -> &mut StatMod<i32> {
+        match typ {
+            StatModType::MeleeAttack => &mut self.melee_attack,
+            StatModType::MissileAttack => &mut self.missile_attack,
+            StatModType::MeleeDamage => &mut self.melee_damage,
+            StatModType::MissileDamage => &mut self.missile_damage,
+            StatModType::Initiative => &mut self.initiative,
+            StatModType::Surprise => &mut self.surprise,
+            StatModType::ArmorClass => &mut self.armor_class,
+            StatModType::SavePP => &mut self.save_petrification_paralysis,
+            StatModType::SavePD => &mut self.save_poison_death,
+            StatModType::SaveBB => &mut self.save_blast_breath,
+            StatModType::SaveSW => &mut self.save_staffs_wands,
+            StatModType::SaveSpells => &mut self.save_spells,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StatMod<T: AddAssign + SubAssign + Clone + Copy> {
     total: T,
     map: HashMap<String, T>,
+    #[serde(skip)]
+    temp_id: String,
+    #[serde(skip)]
+    temp_amount: T,
 }
 
 impl<T: AddAssign + SubAssign + Clone + Copy> StatMod<T> {
@@ -319,6 +380,8 @@ impl<T: AddAssign + SubAssign + Clone + Copy> StatMod<T> {
         Self {
             total: initial,
             map: HashMap::new(),
+            temp_id: String::new(),
+            temp_amount: initial,
         }
     }
 
@@ -352,17 +415,47 @@ impl<T: AddAssign + SubAssign + Clone + Copy> StatMod<T> {
     pub fn view_all(&self) -> Iter<String, T> {
         self.map.iter()
     }
+
+    pub fn new_mod_state(&mut self) -> (&mut String, &mut T) {
+        (&mut self.temp_id, &mut self.temp_amount)
+    }
+
+    pub fn apply_new_mod(&mut self, reset_val: T) {
+        self.add(self.temp_id.clone(), self.temp_amount);
+        self.temp_id.clear();
+        self.temp_amount = reset_val;
+    }
+}
+
+#[simple_enum(no_copy)]
+pub enum TurnType {
+    Movement {
+        action: MovementAction,
+        player_action: Option<MovementAction>,
+    },
+    Attack {
+        action: AttackAction,
+        player_action: Option<AttackAction>,
+    },
+}
+
+impl std::fmt::Display for TurnType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            Self::Movement {..} => egui_phosphor::SNEAKER_MOVE,
+            Self::Attack {..} => egui_phosphor::SWORD,
+        })
+    }
 }
 
 /// An active fight between combatants.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Fight {
     pub started: bool,
-    pub combatants: HashSet<(Owner, CombatantType)>,
-    pub turn_order: Vec<(Owner, CombatantType)>,
-    pub current_turn: usize,
-    pub ongoing_round: bool,
-    pub awaiting_response: Option<Owner>,
+    pub combatants: HashSet<(Owner, Combatant)>,
+    pub declarations: HashMap<Combatant, PreRoundAction>,
+    pub turn_order: Vec<(Owner, Combatant, PreRoundAction)>,
+    pub current_turn: Option<(usize, TurnType)>,
 }
 
 impl Fight {
@@ -370,15 +463,18 @@ impl Fight {
         Self {
             started: false,
             combatants: HashSet::new(),
+            declarations: HashMap::new(),
             turn_order: Vec::new(),
-            current_turn: 0,
-            ongoing_round: false,
-            awaiting_response: None,
+            current_turn: None,
         }
     }
 
-    pub fn get_current_actor(&self) -> CombatantType {
-        self.turn_order.get(self.current_turn).map_or(CombatantType::not_found(), |(_, t)| t.clone())
+    pub fn get_current_actor(&self) -> Combatant {
+        if let Some((turn, _)) = self.current_turn {
+            self.turn_order.get(turn).map_or(Combatant::not_found(), |(_, t, _)| t.clone())
+        } else {
+            Combatant::not_found()
+        }
     }
 
     pub fn start_round(&mut self, data: &mut DMAppData) {
@@ -387,11 +483,12 @@ impl Fight {
             if !data.get_combatant_stats_alt(ctype, |c| c.status_effects.is_incapacitated()).unwrap_or(true) {
                 let mut r = dice::roll(DiceRoll::simple(1, 6)) as i32;
                 r += data.get_combatant_stats_alt(ctype, |c| c.modifiers.initiative.total()).unwrap_or(0);
-                list.push((owner.clone(), ctype.clone(), r));
+
+                list.push((owner.clone(), ctype.clone(), self.declarations.get(ctype).cloned().unwrap_or(PreRoundAction::None), r));
             }
         }
         list.sort_unstable_by(|a, b| {
-            if a.2 == b.2 {
+            if a.3 == b.3 {
                 match a.0 {
                     Owner::DM => {
                         match b.0 {
@@ -415,151 +512,345 @@ impl Fight {
                     },
                 }
             } else {
-                a.2.cmp(&b.2)
+                a.3.cmp(&b.3)
             }
         });
-        self.turn_order = list.into_iter().map(|(o, c, _)| (o, c)).collect();
+        self.turn_order = list.into_iter().map(|(o, c, d, _)| (o, c, d)).collect();
         self.turn_order.reverse();
-        data.log_public("Round started!");
-        self.ongoing_round = true;
+        self.current_turn = Some((0, TurnType::Movement {action: MovementAction::None, player_action: None}));
+        self.update_clients(data);
+    }
+
+    pub fn update_specific_client(&self, data: &mut DMAppData, user: String) {
+        let current_actor = self.get_current_actor();
+        let iter: Vec<(&Owner, &Combatant, &PreRoundAction)> = if self.current_turn.is_none() {
+            self.combatants.iter().map(|(o, c)| (o, c, self.declarations.get(c).unwrap_or(&PreRoundAction::None))).collect()
+        } else {
+            self.turn_order.iter().map(|(o, c, p)| (o, c, p)).collect()
+        };
+        let mut state = CombatState {
+            your_combatants: HashMap::new(),
+            valid_targets: HashSet::new(),
+            round_state: CombatRoundState::NotYourTurn,
+        };
+        for (owner, combatant, pre_round) in iter {
+            if let Owner::Player(player) = owner {
+                if *player != user {
+                    continue;
+                }
+                if data.get_combatant_stats_alt(combatant, |s| s.status_effects.is_incapacitated()).unwrap_or(true) {
+                    continue;
+                }
+                state.your_combatants.insert(combatant.clone(), pre_round.clone());
+                match &self.current_turn {
+                    Some((_, turn_type)) => {
+                        if *combatant == current_actor {
+                            for (o, t, _) in &self.turn_order {
+                                if o == owner {
+                                    continue;
+                                }
+                                if data.get_combatant_stats_alt(t, |c| c.status_effects.is_untargetable()).unwrap_or(true) {
+                                    continue;
+                                }
+                                state.valid_targets.insert(t.clone());
+                            }
+                            state.round_state = match turn_type {
+                                TurnType::Movement {..} => CombatRoundState::MovementAction { combatant: current_actor.clone(), waiting_for_approval: false, temp_action: MovementAction::None },
+                                TurnType::Attack {..} => CombatRoundState::AttackAction { combatant: current_actor.clone(), waiting_for_approval: false, temp_action: AttackAction::None },
+                            };
+                        }
+                    },
+                    None => {
+                        state.round_state = CombatRoundState::PreRound;
+                    },
+                }
+            }
+        }
+        data.send_to_user(ClientBoundPacket::UpdateCombatState(Some(state)), user);
+    }
+
+    pub fn update_clients(&self, data: &mut DMAppData) {
+        if self.current_turn.is_none() {
+            data.log(ChatMessage::no_sender("Round started!").combat());
+        }
+        let current_actor = self.get_current_actor();
+        let mut map: HashMap<String, (HashMap<Combatant, PreRoundAction>, CombatRoundState, HashSet<Combatant>)> = HashMap::new();
+
+        let iter: Vec<(&Owner, &Combatant, &PreRoundAction)> = if self.current_turn.is_none() {
+            self.combatants.iter().map(|(o, c)| (o, c, self.declarations.get(c).unwrap_or(&PreRoundAction::None))).collect()
+        } else {
+            self.turn_order.iter().map(|(o, c, p)| (o, c, p)).collect()
+        };
+        for (owner, combatant, pre_round) in iter {
+            if let Owner::Player(user) = owner {
+                if data.get_combatant_stats_alt(combatant, |s| s.status_effects.is_incapacitated()).unwrap_or(true) {
+                    continue;
+                }
+                let (involved, round_state, targets) = map.entry(user.clone()).or_insert((HashMap::new(), CombatRoundState::NotYourTurn, HashSet::new()));
+                involved.insert(combatant.clone(), pre_round.clone());
+                match &self.current_turn {
+                    Some((_, turn_type)) => {
+                        if *combatant == current_actor {
+                            for (o, t, _) in &self.turn_order {
+                                if o == owner {
+                                    continue;
+                                }
+                                if data.get_combatant_stats_alt(t, |c| c.status_effects.is_untargetable()).unwrap_or(true) {
+                                    continue;
+                                }
+                                targets.insert(t.clone());
+                            }
+                            *round_state = match turn_type {
+                                TurnType::Movement {..} => CombatRoundState::MovementAction { combatant: current_actor.clone(), waiting_for_approval: false, temp_action: MovementAction::None },
+                                TurnType::Attack {..} => CombatRoundState::AttackAction { combatant: current_actor.clone(), waiting_for_approval: false, temp_action: AttackAction::None },
+                            };
+                        }
+                    },
+                    None => {
+                        *round_state = CombatRoundState::PreRound;
+                    },
+                }
+            }
+        }
+        for (user, (your_combatants, round_state, valid_targets)) in map {
+            data.send_to_user(
+                ClientBoundPacket::UpdateCombatState(
+                    Some(CombatState {
+                        your_combatants,
+                        valid_targets,
+                        round_state,
+                    })), 
+                user
+            );
+        }
     }
 
     pub fn next_turn(&mut self, data: &mut DMAppData) {
-        if let Some((owner, ctype)) = self.turn_order.get_mut(self.current_turn) {
-            if data.get_combatant_stats_alt(ctype, |s| s.status_effects.is_incapacitated()).unwrap_or(false) {
-                data.log_public(format!("{} is unable to act!", ctype.name()));
-                self.current_turn += 1;
-                return;
-            }
-            if data.get_combatant_stats_alt(ctype, |s| s.attack_index).unwrap_or(0) == 0 {
-                data.log_public(format!("It is {}'s turn!", ctype.name()));
-            }
-            let mut list = vec![];
-            for (_, comb) in &self.combatants {
-                if comb.id() == ctype.id() {
-                    continue;
+        self.turn_order.retain(|(_, c, _)| data.get_combatant_stats_alt(c, |s| !s.status_effects.is_incapacitated()).unwrap_or(false));
+        match &mut self.current_turn {
+            Some((turn, turn_type)) => {
+                match *turn_type {
+                    TurnType::Movement {..} => {
+                        *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
+                    },
+                    TurnType::Attack {..} => {
+                        *turn += 1;
+                        if *turn >= self.turn_order.len() {
+                            self.current_turn = None;
+                            self.declarations.clear();
+                        } else {
+                            *turn_type = TurnType::Movement {action: MovementAction::None, player_action: None};
+                        }
+                    },
                 }
-                if data.get_combatant_stats_alt(comb, |c| c.status_effects.is_untargetable()).unwrap_or(true) {
-                    continue;
+            },
+            None => {},
+        }
+        self.update_clients(data);
+        // if let Some((owner, ctype)) = self.turn_order.get_mut(self.current_turn) {
+        //     if data.get_combatant_stats_alt(ctype, |s| s.status_effects.is_incapacitated()).unwrap_or(false) {
+        //         data.log(ChatMessage::no_sender(format!("{} is unable to act!", ctype.name())).combat());
+        //         self.current_turn += 1;
+        //         return;
+        //     }
+        //     if data.get_combatant_stats_alt(ctype, |s| s.attack_index).unwrap_or(0) == 0 {
+        //         data.log(ChatMessage::no_sender(format!("It is {}'s turn!", ctype.name())).combat());
+        //     }
+        //     let mut list = vec![];
+        //     for (ow, comb) in &self.combatants {
+        //         if comb.id() == ctype.id() || ow == owner {
+        //             continue;
+        //         }
+        //         if data.get_combatant_stats_alt(comb, |c| c.status_effects.is_untargetable()).unwrap_or(true) {
+        //             continue;
+        //         }
+        //         list.push(comb.clone());
+        //     }
+        //     if let Owner::Player(p) = &owner {
+        //         if !data.connected_users.contains_key(p) {
+        //             *owner = Owner::DM;
+        //         }
+        //     }
+        //     match owner {
+        //         Owner::DM => {
+        //             data.temp_state.selected_target = 0;
+        //             data.temp_state.combatant_list = list;
+        //         },
+        //         Owner::Player(player) => {
+        //             data.temp_state.selected_target = 0;
+        //             data.temp_state.combatant_list = list.clone();
+        //             data.send_to_user(ClientBoundPacket::DecideCombatAction(ctype.clone(), list), player.clone());
+        //         },
+        //     }
+        //     self.awaiting_response = Some(owner.clone());
+        // } else {
+        //     self.current_turn = 0;
+        //     data.log(ChatMessage::no_sender("Round concluded!").combat());
+        //     self.ongoing_round = false;
+        // }
+    }
+
+    pub fn resolve_action(&mut self, data: &mut DMAppData) {
+        if let Some((turn, turn_type)) = &mut self.current_turn {
+            if let Some((_, actor, dec)) = self.turn_order.get(*turn) {
+                match turn_type {
+                    TurnType::Movement {action, ..} => {
+                        match action {
+                            MovementAction::None => {
+                                self.next_turn(data);
+                            },
+                            MovementAction::Move => {
+                                data.log(ChatMessage::no_sender(format!("{} moves.", actor.name())).combat());
+                                self.next_turn(data);
+                            },
+                            MovementAction::Run => {
+                                data.log(ChatMessage::no_sender(format!("{} runs.", actor.name())).combat());
+                                *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
+                                self.next_turn(data);
+                            },
+                            MovementAction::Charge => {
+                                data.log(ChatMessage::no_sender(format!("{} charges.", actor.name())).combat());
+                                *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
+                                self.next_turn(data);
+                            },
+                            MovementAction::FightingWithdrawal => {
+                                data.log(ChatMessage::no_sender(format!("{} makes a fighting withdrawal.", actor.name())).combat());
+                                *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
+                                self.next_turn(data);
+                            },
+                            MovementAction::FullRetreat => {
+                                data.log(ChatMessage::no_sender(format!("{} makes a full retreat.", actor.name())).combat());
+                                *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
+                                self.next_turn(data);
+                            },
+                            MovementAction::SimpleAction => {
+                                data.log(ChatMessage::no_sender(format!("{} performs a simple action.", actor.name())).combat());
+                                self.next_turn(data);
+                            },
+                        }
+                    },
+                    TurnType::Attack {action, ..} => {
+                        match action {
+                            AttackAction::None => {
+                                self.next_turn(data);
+                            },
+                            AttackAction::Attack(target, modifier) => {
+                                let target = target.clone();
+                                let actor = actor.clone();
+                                let modifier = modifier.clone();
+                                self.make_attack(data, &actor, &target, modifier);
+                            },
+                            AttackAction::SpecialManeuver(target, maneuver, _modifier) => {
+                                data.log(ChatMessage::no_sender(format!("{} tries to {} {}!", actor.name(), maneuver, target.name())).combat());
+                                self.next_turn(data);
+                            },
+                            AttackAction::CastSpell => {
+                                if let PreRoundAction::CastSpell(id, lvl, typ) = dec {
+                                    if let Combatant::PC(user, name) = actor {
+                                        data.apply_to_pc(user, name, |sheet| {
+                                            match typ {
+                                                MagicType::Arcane => {
+                                                    if let Some(_spells) = &mut sheet.arcane_spells {
+                                                        
+                                                    }
+                                                },
+                                                MagicType::Divine => {
+
+                                                },
+                                            }
+                                        });
+                                    }
+                                    data.log(ChatMessage::no_sender(format!("{} casts {}!", actor.name(), data.spell_registry.get_spell_name_or_default(id, *lvl, *typ))).combat());
+                                } else {
+                                    data.log(ChatMessage::no_sender(format!("{} tries to cast a spell that they didn't declare.", actor)).combat().light_red());
+                                }
+                                self.next_turn(data);
+                            },
+                            AttackAction::OtherAction => {
+                                data.log(ChatMessage::no_sender(format!("{} performs a simple action.", actor.name())).combat());
+                                self.next_turn(data);
+                            },
+                        }
+                    },
                 }
-                list.push(comb.clone());
+            } else {
+                self.next_turn(data);
             }
-            if let Owner::Player(p) = &owner {
-                if !data.connected_users.contains_key(p) {
-                    *owner = Owner::DM;
-                }
-            }
-            match owner {
-                Owner::DM => {
-                    data.temp_state.selected_target = 0;
-                    data.temp_state.combatant_list = list;
-                },
-                Owner::Player(player) => {
-                    data.temp_state.selected_target = 0;
-                    data.temp_state.combatant_list = list.clone();
-                    data.send_to_user(ClientBoundPacket::DecideCombatAction(ctype.clone(), list), player.clone());
-                },
-            }
-            self.awaiting_response = Some(owner.clone());
-        } else {
-            self.current_turn = 0;
-            data.log_public("Round concluded!");
-            self.ongoing_round = false;
         }
     }
 
-    pub fn resolve_action(&mut self, data: &mut DMAppData, action: CombatAction) {
-        match &action {
-            CombatAction::Attack(target) => {
-                let current_actor = self.get_current_actor();
-                match attack_roll(data, &current_actor, target) {
-                    AttackResult::CriticalFail => {
-                        let msg = match dice::roll(DiceRoll::simple(1, 6)) {
-                            ..=1 => format!("{} failed miserably when attacking {}!", current_actor.name(), target.name()),
-                            2 => format!("{} critically missed {}!", current_actor.name(), target.name()),
-                            3 => format!("{} utterly whiffed an attempt to hit {}!", current_actor.name(), target.name()),
-                            4 => format!("{} absolutely annihilated the air nearby to {}.", current_actor.name(), target.name()),
-                            5 => format!("Whatever {} tried to do to {}, it didn\'t work very well.", current_actor.name(), target.name()),
-                            6.. => format!("{} lands a devastating warning blow toward {}! It did absolutely nothing.", current_actor.name(), target.name()),
-                        };
-                        data.log_public(msg);
-                    },
-                    AttackResult::Fail => {
-                        data.log_public(format!("{} missed {}!", current_actor.name(), target.name()));
-                    },
-                    AttackResult::Success => {
-                        let damage = damage_roll(data, &current_actor, false);
-                        let mut killed = false;
-                        data.get_combatant_stats(target, |stats| {
-                            if let Some(stats) = stats {
-                                stats.health.current_hp -= damage;
-                                if stats.health.current_hp <= 0 {
-                                    stats.status_effects.effects.insert(StatusEffect::Dying);
-                                    killed = true;
-                                }
-                            }
-                        });
-                        data.log_public(format!("{} hit {} for {} damage!", current_actor.name(), target.name(), damage));
-                        if killed {
-                            data.log_public(format!("{} was killed!", target.name()));
-                        }
-                    },
-                    AttackResult::CriticalSuccess => {
-                        let damage = damage_roll(data, &current_actor, true);
-                        let mut killed = false;
-                        data.get_combatant_stats(target, |stats| {
-                            if let Some(stats) = stats {
-                                stats.health.current_hp -= damage;
-                                if stats.health.current_hp <= 0 {
-                                    stats.status_effects.effects.insert(StatusEffect::Dying);
-                                    killed = true;
-                                }
-                            }
-                        });
-                        let msg = match dice::roll(DiceRoll::simple(1, 6)) {
-                            ..=1 => format!("{} critically hit {} for a whopping {} damage!", current_actor.name(), target.name(), damage),
-                            2 => format!("{} absolutely devastated {} for {} damage!", current_actor.name(), target.name(), damage),
-                            3 => format!("{} expertly struck {} for {} damage!", current_actor.name(), target.name(), damage),
-                            4 => format!("{} showed {} who\'s boss. It did {} damage!", current_actor.name(), target.name(), damage),
-                            5 => format!("{} obliterated {} for a staggering {} damage!", current_actor.name(), target.name(), damage),
-                            6.. => format!("{} asked nicely for {} to go away. With force. It did {} damage!", current_actor.name(), target.name(), damage),
-                        };
-                        data.log_public(msg);
-                        if killed {
-                            data.log_public(format!("{} was killed!", target.name()));
-                        }
-                    },
-                }
-                if data.get_combatant_stats(&current_actor, |stats| {
-                    if let Some(stats) = stats {
-                        stats.attack_index += 1;
-                        if stats.current_damage().is_none() {
-                            stats.attack_index = 0;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        true
-                    }
-                }) {
-                    self.current_turn += 1;
-                    self.awaiting_response = None;
-                } else {
-                    self.next_turn(data);
-                }
-                data.update_combatant(target);
-                data.update_combatant(&current_actor);
+    pub fn make_attack(&mut self, data: &mut DMAppData, attacker: &Combatant, target: &Combatant, modifier: i32) {
+        match attack_roll(data, attacker, target, modifier) {
+            AttackResult::CriticalFail => {
+                let msg = match dice::roll(DiceRoll::simple(1, 6)) {
+                    ..=1 => format!("{} failed miserably when attacking {}!", attacker.name(), target.name()),
+                    2 => format!("{} critically missed {}!", attacker.name(), target.name()),
+                    3 => format!("{} utterly whiffed an attempt to hit {}!", attacker.name(), target.name()),
+                    4 => format!("{} absolutely annihilated the air nearby to {}.", attacker.name(), target.name()),
+                    5 => format!("Whatever {} tried to do to {}, it didn\'t work very well.", attacker.name(), target.name()),
+                    6.. => format!("{} lands a devastating warning blow toward {}! It did absolutely nothing.", attacker.name(), target.name()),
+                };
+                data.log(ChatMessage::no_sender(msg).combat().dice_roll());
             },
-            CombatAction::RelinquishControl => {
-                self.awaiting_response = Some(Owner::DM);
-                return;
+            AttackResult::Fail => {
+                data.log(ChatMessage::no_sender(format!("{} missed {}!", attacker.name(), target.name())).combat().dice_roll());
+            },
+            AttackResult::Success => {
+                let damage = damage_roll(data, attacker, false);
+                let mut killed = false;
+                data.get_combatant_stats(target, |stats| {
+                    if let Some(stats) = stats {
+                        killed = stats.hurt(damage as u32);
+                    }
+                });
+                data.log(ChatMessage::no_sender(format!("{} hit {} for {} damage!", attacker.name(), target.name(), damage)).combat().dice_roll());
+                if killed {
+                    data.log(ChatMessage::no_sender(format!("{} was killed!", target.name())).combat().red());
+                }
+            },
+            AttackResult::CriticalSuccess => {
+                let damage = damage_roll(data, attacker, true);
+                let mut killed = false;
+                data.get_combatant_stats(target, |stats| {
+                    if let Some(stats) = stats {
+                        killed = stats.hurt(damage as u32);
+                    }
+                });
+                let msg = match dice::roll(DiceRoll::simple(1, 6)) {
+                    ..=1 => format!("{} critically hit {} for a whopping {} damage!", attacker.name(), target.name(), damage),
+                    2 => format!("{} absolutely devastated {} for {} damage!", attacker.name(), target.name(), damage),
+                    3 => format!("{} expertly struck {} for {} damage!", attacker.name(), target.name(), damage),
+                    4 => format!("{} showed {} who\'s boss. It did {} damage!", attacker.name(), target.name(), damage),
+                    5 => format!("{} obliterated {} for a staggering {} damage!", attacker.name(), target.name(), damage),
+                    6.. => format!("{} asked nicely for {} to go away. With force. It did {} damage!", attacker.name(), target.name(), damage),
+                };
+                data.log(ChatMessage::no_sender(msg).combat().dice_roll());
+                if killed {
+                    data.log(ChatMessage::no_sender(format!("{} was killed!", target.name())).combat().red());
+                }
             },
         }
+        if data.get_combatant_stats(attacker, |stats| {
+            if let Some(stats) = stats {
+                stats.attack_index += 1;
+                if stats.current_damage().is_none() {
+                    stats.attack_index = 0;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        }) {
+            self.next_turn(data);
+        }
+        data.update_combatant(target);
+        data.update_combatant(attacker);
     }
 }
 
-pub fn damage_roll(data: &mut DMAppData, attacker: &CombatantType, critical: bool) -> i32 {
+pub fn damage_roll(data: &mut DMAppData, attacker: &Combatant, critical: bool) -> i32 {
     data.get_combatant_stats_alt(attacker, |stats| {
         let damage = stats.current_damage().unwrap_or(DamageRoll::default());
         let mut nat = damage.roll();
@@ -583,7 +874,7 @@ pub fn damage_roll(data: &mut DMAppData, attacker: &CombatantType, critical: boo
     }).unwrap_or(1)
 }
 
-pub fn attack_roll(data: &mut DMAppData, attacker: &CombatantType, target: &CombatantType) -> AttackResult {
+pub fn attack_roll(data: &mut DMAppData, attacker: &Combatant, target: &Combatant, modifiers: i32) -> AttackResult {
     let attack_throw = data.get_combatant_stats_alt(attacker, |s| {
         match s.current_damage().unwrap_or(DamageRoll::default()).attack_type {
             AttackType::Melee => {
@@ -599,7 +890,7 @@ pub fn attack_roll(data: &mut DMAppData, attacker: &CombatantType, target: &Comb
     if r <= 1 {
         return AttackResult::CriticalFail;
     }
-    match r + attack_throw - armor_class {
+    match r + attack_throw - armor_class + modifiers {
         ..=19 => AttackResult::Fail,
         20..=29 => AttackResult::Success,
         30.. => AttackResult::CriticalSuccess,
@@ -629,15 +920,21 @@ pub enum Owner {
     Player(String),
 }
 
-/// What type of combatant this is. If it's an enemy, stores the enemy name and its ID. If it's a
-/// PC, stores the user's username and the character's name.
+/// A combatant, either a player character or enemy. 
+/// 
+/// ### Fields
+/// - `Enemy.0`: The enemy type registry ID.
+/// - `Enemy.1`: The numerical index of this enemy, for when there are more than one of the same type.
+/// - `Enemy.2`: The enemy type name, so it doesn't have to be looked up constantly.
+/// - `PC.0`: The player username.
+/// - `PC.1`: The player character name.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
-pub enum CombatantType {
+pub enum Combatant {
     Enemy(String, u32, String),
     PC(String, String),
 }
 
-impl CombatantType {
+impl Combatant {
     /// Gets the formatted display name for this combatant.
     pub fn name(&self) -> String {
         match self {
@@ -654,7 +951,7 @@ impl CombatantType {
         }
     }
 
-    /// Gets the internal identifier for this combatant.
+    /// Gets a string that can uniquely identify this combatant.
     pub fn id(&self) -> String {
         match self {
             Self::Enemy(type_id, id, _) => {
@@ -666,8 +963,100 @@ impl CombatantType {
         }
     }
 
+    /// A combatant that doesn't exist, in case of an error.
     pub fn not_found() -> Self {
         Self::PC("server".to_owned(), "Nonexistent combatant. If you see this, something has gone wrong.".to_owned())
     }
+}
+
+impl std::fmt::Display for Combatant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Combatant::Enemy(_, n, name) => {
+                if *n > 0 {
+                    write!(f, "{} {}", name, *n + 1)
+                } else {
+                    write!(f, "{}", name)
+                }
+            },
+            Combatant::PC(_, name) => {
+                write!(f, "{}", name)
+            },
+        }
+    }
+}
+
+#[simple_enum(no_copy, display)]
+pub enum PreRoundAction {
+    /// None
+    None,
+    /// Fighting Withdrawal
+    FightingWithdrawal,
+    /// Full Retreat
+    FullRetreat,
+    /// Cast Spell
+    CastSpell(String, u8, MagicType),
+}
+
+#[simple_enum(display)]
+pub enum MovementAction {
+    /// None
+    None,
+    /// Move
+    Move,
+    /// Run
+    Run,
+    /// Charge
+    Charge,
+    /// Fighting Withdrawal
+    FightingWithdrawal,
+    /// Full Retreat
+    FullRetreat,
+    /// Simple Action
+    SimpleAction,
+}
+
+#[simple_enum(no_copy, display)]
+pub enum AttackAction {
+    /// None
+    None,
+    /// Attack
+    Attack(Combatant, i32),
+    /// Special Maneuver ({1})
+    SpecialManeuver(Combatant, SpecialManeuver, i32),
+    /// Cast Spell
+    CastSpell,
+    /// Other Action
+    OtherAction,
+}
+
+impl AttackAction {
+    pub fn display_alt(&self) -> String {
+        match self {
+            Self::Attack(target, _) => {
+                format!("Attack {}", target.name())
+            },
+            Self::SpecialManeuver(target, maneuver, _) => {
+                format!("{} {}", maneuver, target.name())
+            },
+            _ => format!("{}", self)
+        }
+    }
+}
+
+#[simple_enum(display)]
+pub enum SpecialManeuver {
+    /// Disarm
+    Disarm,
+    /// Force Back
+    ForceBack,
+    /// Incapacitate
+    Incapacitate,
+    /// Knock Down
+    KnockDown,
+    /// Sunder
+    Sunder,
+    /// Wrestle
+    Wrestle,
 }
 

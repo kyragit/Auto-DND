@@ -53,6 +53,9 @@ impl Class {
         }
     }
     pub fn calculate_next_level_cost(&self, current_level: u8) -> u32 {
+        if current_level >= self.maximum_level {
+            return u32::MAX;
+        }
         match current_level {
             0 => 100,
             1..=5 => self.base_xp_cost * (2u32.pow(current_level as u32 - 1)),

@@ -96,9 +96,9 @@ pub struct ProficiencyInstance {
 }
 
 impl ProficiencyInstance {
-    pub fn from_prof(prof: Proficiency) -> Self {
+    pub fn from_prof(prof: Proficiency, spec: Option<String>) -> Self {
         Self {
-            specification: if prof.requires_specification {Some("".to_owned())} else {None},
+            specification: spec,
             prof_level: 0,
             throw: prof.starting_throw.clone(),
             prof,

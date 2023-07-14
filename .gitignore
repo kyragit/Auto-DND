@@ -6,6 +6,7 @@ enemies/
 items/
 proficiencies/
 spells/
+maps/
 simple_enum_macro/target/
 savedata.ron
 preferences.ron
