@@ -2,7 +2,7 @@ use std::collections::{HashMap, BTreeMap};
 
 use serde::{Serialize, Deserialize};
 
-use crate::{enemy::{EnemyType, Enemy}, item::Item};
+use crate::{enemy::{EnemyType, Enemy}, item::Item, combat::Fight};
 
 /// A large data structure representing an entire map, like a dungeon or town. This is NOT a literal,
 /// grid-based map; rather, it's just a collection of rooms without the notion of spatial position.
@@ -16,6 +16,7 @@ pub struct Map {
     /// All the rooms in this map. The key is conventionally the room number, but it could be anything really.
     pub rooms: BTreeMap<String, Room>,
     pub connections: HashMap<String, RoomConnection>,
+    pub fight: Option<Fight>,
 }
 
 impl Map {
@@ -25,6 +26,7 @@ impl Map {
             summary: String::new(),
             rooms: BTreeMap::new(),
             connections: HashMap::new(),
+            fight: None,
         }
     }
 }

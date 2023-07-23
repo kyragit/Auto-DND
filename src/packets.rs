@@ -6,7 +6,7 @@ use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
 use crate::character::{PlayerCharacter, PlayerEquipSlot};
 use crate::class::Class;
-use crate::combat::{Combatant, SavingThrowType, PreRoundAction, MovementAction, TurnType, Owner, AttackAction};
+use crate::combat::{Combatant, SavingThrowType, PreRoundAction, MovementAction, AttackAction, Owner, TurnType};
 use crate::common_ui::ChatMessage;
 use crate::dm_app::{DMAppData, UserData, Registry};
 use crate::party::Party;
@@ -375,16 +375,18 @@ impl ServerBoundPacket {
             },
             Self::MakePreRoundDeclaration(combatant, action) => {
                 if let Some(username) = data.get_username_by_addr(user) {
-                    if let Some(fight) = &mut data.fight {
-                        if fight.started && fight.current_turn.is_none() {
-                            if fight.combatants.contains(&(Owner::Player(username.clone()), combatant.clone())) {
-                                if action == PreRoundAction::None {
-                                    fight.declarations.remove(&combatant);
-                                } else {
-                                    fight.declarations.insert(combatant.clone(), action);
+                    if let Some((_, map)) = &mut data.loaded_map {
+                        if let Some(fight) = &mut map.fight {
+                            if fight.started && fight.current_turn.is_none() {
+                                if fight.combatants.contains(&(Owner::Player(username.clone()), combatant.clone())) {
+                                    if action == PreRoundAction::None {
+                                        fight.declarations.remove(&combatant);
+                                    } else {
+                                        fight.declarations.insert(combatant.clone(), action);
+                                    }
+                                    // this is annoying
+                                    fight.clone().update_specific_client(data, username);
                                 }
-                                // this is annoying
-                                fight.clone().update_specific_client(data, username);
                             }
                         }
                     }
@@ -392,7 +394,7 @@ impl ServerBoundPacket {
             },
             Self::DecideMovementAction(action) => {
                 if let Some(username) = data.get_username_by_addr(user) {
-                    if let Some(fight) = &mut data.fight {
+                    data.get_fight(|fight| {
                         if let Some((turn, turn_type)) = &mut fight.current_turn {
                             if let Some((owner, _, _)) = fight.turn_order.get(*turn) {
                                 if *owner == Owner::Player(username) {
@@ -402,12 +404,12 @@ impl ServerBoundPacket {
                                 }
                             }
                         }
-                    }
+                    });
                 }
             },
             Self::DecideAttackAction(action) => {
                 if let Some(username) = data.get_username_by_addr(user) {
-                    if let Some(fight) = &mut data.fight {
+                    data.get_fight(|fight| {
                         if let Some((turn, turn_type)) = &mut fight.current_turn {
                             if let Some((owner, _, _)) = fight.turn_order.get(*turn) {
                                 if *owner == Owner::Player(username) {
@@ -417,7 +419,7 @@ impl ServerBoundPacket {
                                 }
                             }
                         }
-                    }
+                    });
                 }
             },
         }

@@ -228,6 +228,8 @@ impl PlayerApp {
                 }
                 if data.show_error {
                     ui.colored_label(Rgba::RED, "Could not connect to server.");
+                } else {
+                    ui.label(RichText::new("Caution! Using this app will expose your IP address! This app is not a secure platform, do not store any sensitive information within!").color(Color32::YELLOW).small());
                 }
                 false
             }).inner
@@ -476,7 +478,7 @@ impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
                     },
                     CharacterSheetTab::Inventory => {
                         if let Some(state) = &data.combat_state {
-                            if state.your_combatants.contains_key(&Combatant::PC(data.username.clone(), name.clone())) {
+                            if state.your_combatants.contains_key(&Combatant::pc(data.username.clone(), name.clone())) {
                                 ui.colored_label(Color32::LIGHT_RED, "This character is in combat. A combat action is required to change your inventory in most circumstances. Ask the DM if what you're doing is allowed.");
                                 ui.separator();
                             }
@@ -749,9 +751,9 @@ impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
                                                                 }
                                                                 if let Some(state) = &data.combat_state {
                                                                     if state.round_state == CombatRoundState::PreRound {
-                                                                        if state.your_combatants.contains_key(&Combatant::PC(data.username.clone(), name.clone())) {
+                                                                        if state.your_combatants.contains_key(&Combatant::pc(data.username.clone(), name.clone())) {
                                                                             if ui.button("Declare").clicked() {
-                                                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(Combatant::PC(data.username.clone(), name.clone()), PreRoundAction::CastSpell(spell_id.clone(), i as u8, MagicType::Divine)));
+                                                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(Combatant::pc(data.username.clone(), name.clone()), PreRoundAction::CastSpell(spell_id.clone(), i as u8, MagicType::Divine)));
                                                                                 (self.callback)(PlayerTab::Combat, TabCallbackMode::AddOrFocus);
                                                                             }
                                                                         }
@@ -805,9 +807,9 @@ impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
                                                                 }
                                                                 if let Some(state) = &data.combat_state {
                                                                     if state.round_state == CombatRoundState::PreRound {
-                                                                        if state.your_combatants.contains_key(&Combatant::PC(data.username.clone(), name.clone())) {
+                                                                        if state.your_combatants.contains_key(&Combatant::pc(data.username.clone(), name.clone())) {
                                                                             if ui.button("Declare").clicked() {
-                                                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(Combatant::PC(data.username.clone(), name.clone()), PreRoundAction::CastSpell(spell_id.clone(), i as u8, MagicType::Arcane)));
+                                                                                packets.push(ServerBoundPacket::MakePreRoundDeclaration(Combatant::pc(data.username.clone(), name.clone()), PreRoundAction::CastSpell(spell_id.clone(), i as u8, MagicType::Arcane)));
                                                                                 (self.callback)(PlayerTab::Combat, TabCallbackMode::AddOrFocus);
                                                                             }
                                                                         }
@@ -1446,7 +1448,7 @@ impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
                             } else {
                                 ui.menu_button("Declare", |ui| {
                                     match combatant {
-                                        Combatant::PC(_, name) => {
+                                        Combatant::PC { user: _, name } => {
                                             if ui.button("Cast Spell").clicked() {
                                                 data.character_window_tab_state.insert(name.clone(), CharacterSheetTab::Spells);
                                                 (self.callback)(PlayerTab::Character(name.clone()), TabCallbackMode::AddOrFocus);
@@ -1461,7 +1463,7 @@ impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
                                                 ui.close_menu();
                                             }
                                         },
-                                        Combatant::Enemy(_, _, _) => {
+                                        Combatant::Enemy { .. } => {
     
                                         },
                                     }
@@ -1538,19 +1540,19 @@ impl<'a, F: FnMut(PlayerTab, TabCallbackMode) + 'a> PlayerTabViewer<'a, F> {
                         match temp_action {
                             AttackAction::Attack(target, _) => {
                                 egui::ComboBox::from_label("Target")
-                                    .selected_text(target.name())
+                                    .selected_text(target.to_string())
                                     .show_ui(ui, |ui| {
                                         for t in &state.valid_targets {
-                                            ui.selectable_value(target, t.clone(), t.name());
+                                            ui.selectable_value(target, t.clone(), t.to_string());
                                         }
                                     });
                             },
                             AttackAction::SpecialManeuver(target, maneuver, _) => {
                                 egui::ComboBox::from_label("Target")
-                                    .selected_text(target.name())
+                                    .selected_text(target.to_string())
                                     .show_ui(ui, |ui| {
                                         for t in &state.valid_targets {
-                                            ui.selectable_value(target, t.clone(), t.name());
+                                            ui.selectable_value(target, t.clone(), t.to_string());
                                         }
                                     });
                                 egui::ComboBox::from_label("Maneuver")

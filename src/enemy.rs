@@ -149,6 +149,20 @@ impl EnemyHitDice {
             Self::Special(roll) => roll.to_notation(),
         }
     }
+
+    pub fn roll(&self) -> u32 {
+        match self {
+            Self::Standard(amount) => {
+                DiceRoll::simple(*amount, 8).roll() as u32
+            },
+            Self::WithModifier(amount, modifier) => {
+                DiceRoll::simple_modifier(*amount, 8, *modifier).roll() as u32
+            },
+            Self::Special(roll) => {
+                roll.roll() as u32
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]

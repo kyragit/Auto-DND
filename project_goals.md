@@ -60,10 +60,10 @@
 - Implement cleaves **
 - Figure out spell repertoire and levelling **
 - Create a "party" system. The party stores temporary XP to allocate. ***
+    - Let players create parties
 - Implement henchmen. **
 - XP Calculation (stores xp gained, then DM can press button when in town) ***
-- Deployed items/containers. *
-- Probably replace the idea of "deployed" enemies/items with a more general idea of "maps". **
+- ~~Probably replace the idea of "deployed" enemies/items with a more general idea of "maps".~~ ***
     - They are not literal maps, but rather a list of "rooms" that have an ID and a list of all the
     items/enemies in that room. These maps are stored to disk and so are only loaded when they're 
     actually being used. They might also support random encounters and/or random treasure generation.
@@ -80,7 +80,21 @@
         - Arguments against storing it:
             - In order to return the map to its initial state, you'd have to make a copy of it.
         - I'm gonna go with yes, it should.
-- Custom font/theme *
+- Treasure generator **
+- Enemy descriptions *
+- ~~Support multiple stored fights~~ ***
+- ~~Connect the combat system with maps~~ ***
+    - Each map stores an optional fight object. I think I will require fights to be inside of a map,
+    because it makes it far more complicated if I don't, and the DM can just make a "dummy map" for
+    fights out in the wilderness or whatever. This way, I also get having multiple stored fights 
+    for free.
+- ~~DM "tellraw" command~~ *
 
 ### Technical
 - ~~Create a generic registry viewer~~ **
+- Refactor everything... *sigh* *
+
+### Visual
+- Custom icon *
+- Custom font/theme *
+- Properly decide on a name **

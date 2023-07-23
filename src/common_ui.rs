@@ -1,8 +1,9 @@
 use std::hash::Hash;
 
-use crate::{dice::{DiceRoll, ModifierType, Drop}, combat::{DamageRoll, StatMod}, dm_app::{Registry, RegistryNode}, enemy::EnemyType};
+use crate::{dice::{DiceRoll, ModifierType, Drop}, combat::{DamageRoll, StatMod}, dm_app::{Registry, RegistryNode}, enemy::EnemyType, item::{ItemType, Item, WeaponDamage, MeleeDamage, ContainerStats}};
 use eframe::{egui::{self, Ui, RichText, Button, TextFormat}, epaint::{text::LayoutJob, Color32}, emath::Align};
-use egui::{FontId, Stroke, Id, WidgetText};
+use egui::{FontId, Stroke, Id, WidgetText, InnerResponse};
+use egui_dock::Tree;
 use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
 
@@ -155,12 +156,28 @@ pub fn link_button_frameless(ui: &mut Ui) -> bool {
     ui.add(egui::Button::new("\u{e972}").small().frame(false)).clicked()
 }
 
+pub fn trash_button_frameless(ui: &mut Ui) -> bool {
+    ui.add(egui::Button::new("\u{ed8a}").small().frame(false)).clicked()
+}
+
 pub fn check_button(ui: &mut Ui) -> bool {
     ui.small_button(RichText::new("\u{ea30}").color(Color32::GREEN)).clicked()
 }
 
 pub fn x_button(ui: &mut Ui) -> bool {
     ui.small_button(RichText::new("\u{eddb}").color(Color32::RED)).clicked()
+}
+
+pub fn plus_button(ui: &mut Ui) -> bool {
+    ui.button(RichText::new("\u{ec86}").color(Color32::LIGHT_GREEN).small()).clicked()
+}
+
+pub fn plus_menu_button<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> InnerResponse<Option<R>> {
+    ui.menu_button(RichText::new("\u{ec86}").color(Color32::LIGHT_GREEN).small(), add_contents)
+}
+
+pub fn frameless_button(ui: &mut Ui, icon: &'static str) -> bool {
+    ui.add(egui::Button::new(icon).small().frame(false)).clicked()
 }
 
 pub fn stat_mod_i32_button(ui: &mut Ui, stat_mod: &mut StatMod<i32>) {
@@ -673,4 +690,139 @@ pub fn enemy_viewer_callback(ui: &mut Ui, registry: &Registry<EnemyType>, id_sou
     );
     ui.ctx().data_mut(|map| map.insert_temp(id, viewed));
     picked.flatten()
+}
+
+/// Creates an item viewer in the given `Ui` and returns the picked item, or `None`.
+/// ### Parameters
+/// - `ui`: the `Ui` to paint in.
+/// - `registry`: the item registry to search.
+/// - `id_source`: a semi-unique hashable value, for storing the state of the viewer. It should not
+/// change over time, and should be unique to all other item viewers.
+/// ### Returns
+/// `None` if nothing was picked, or `Some((id, item))`, where `id` is the item's registry path
+/// and `item` is the `Item`.
+pub fn item_viewer_callback(ui: &mut Ui, registry: &Registry<ItemType>, id_source: impl Hash) -> Option<(String, Item)> {
+    let id = Id::new(id_source).with("item_viewer_callback");
+    let viewed = ui.ctx().data(|map| {
+        if let Some(viewed) = map.get_temp::<Option<String>>(id) {
+            viewed
+        } else {
+            None
+        }
+    });
+    let (viewed, picked, _) = registry_viewer(
+        ui,
+        registry,
+        viewed,
+        |i| format!("View: {}", i.name).into(),
+        |_| None,
+        || None,
+        |ui, path, item| {
+            let mut count = ui.ctx().data(|map| {
+                if let Some(count) = map.get_temp::<u32>(id) {
+                    count
+                } else {
+                    1
+                }
+            });
+            if ui.button("Pick").clicked() {
+                ui.ctx().data_mut(|map| map.insert_temp(id, 1u32));
+                return Some((path.clone(), Item::from_type(item.clone(), count)));
+            }
+            ui.add(egui::DragValue::new(&mut count).prefix("Count: ").clamp_range(1..=u32::MAX));
+            ui.ctx().data_mut(|map| map.insert_temp(id, count));
+            None
+        },
+        |ui, _, item| {
+            ui.heading(&item.name);
+            ui.label(RichText::new(&item.description).weak().italics());
+            ui.separator();
+            ui.label(format!("Encumbrance: {}", item.encumbrance.display()));
+            ui.label(format!("Value: {:.1} sp", item.value.0))
+                .on_hover_text(
+                RichText::new(format!("{:.1} cp\n{:.1} sp\n{:.1} ep\n{:.1} gp\n{:.1} pp", 
+                    item.value.as_copper(),
+                    item.value.as_silver(),
+                    item.value.as_electrum(),
+                    item.value.as_gold(),
+                    item.value.as_platinum(),
+                )).weak().italics());
+            let mut list = "Tags: ".to_owned();
+            if item.tags.is_empty() {
+                list.push_str("None");
+            } else {
+                for (i, tag) in item.tags.iter().enumerate() {
+                    if i == 0 {
+                        list.push_str(&format!("{}", tag));
+                    } else {
+                        list.push_str(&format!(", {}", tag));
+                    }
+                }
+            }
+            ui.label(list);
+            ui.separator();
+            if let Some(weapon) = &item.weapon_stats {
+                match &weapon.damage {
+                    WeaponDamage::Melee(melee) => {
+                        ui.label(RichText::new("Melee weapon").strong().underline());
+                        ui.label(format!("Style: {}", melee.display()));
+                        match melee {
+                            MeleeDamage::OneHanded(dmg) => {
+                                ui.label(format!("Damage: {}", dmg.to_notation()));
+                            },
+                            MeleeDamage::Versatile(dmg1, dmg2) => {
+                                ui.label(format!("Damage: {}/{}", dmg1.to_notation(), dmg2.to_notation()));
+                            },
+                            MeleeDamage::TwoHanded(dmg) => {
+                                ui.label(format!("Damage: {}", dmg.to_notation()));
+                            },
+                        }
+                    },
+                    WeaponDamage::Missile(damage, ammo) => {
+                        ui.label(RichText::new("Missile weapon").strong().underline());
+                        ui.label(format!("Damage: {}", damage.to_notation()));
+                        ui.label(format!("Ammo: {}", ammo));
+                    },
+                }
+                ui.separator();
+            }
+            if let Some(armor) = &item.armor_stats {
+                ui.label(RichText::new("Armor").strong().underline());
+                ui.label(format!("AC: {}", armor));
+                ui.separator();
+            }
+            if let Some(shield) = &item.shield_stats {
+                ui.label(RichText::new("Shield").strong().underline());
+                ui.label(format!("AC: {:+}", shield));
+                ui.separator();
+            }
+            if let Some(container) = &item.container_stats {
+                ui.label(RichText::new("Container").strong().underline());
+                match container {
+                    ContainerStats::Items(i) => {
+                        ui.label(format!("Holds: {} items", i));
+                    },
+                    ContainerStats::Stone(i) => {
+                        ui.label(format!("Holds: {} stone", i));
+                    },
+                }
+                ui.separator();
+            }
+        },
+    );
+    ui.ctx().data_mut(|map| map.insert_temp(id, viewed));
+    picked.flatten()
+}
+
+pub fn tree_callback<Tab: PartialEq>(tree: &mut Tree<Tab>, tab: Tab, add: bool) {
+    if let Some((node_i, tab_i)) = tree.find_tab(&tab) {
+        if add {
+            tree.set_focused_node(node_i);
+            tree.set_active_tab(node_i, tab_i);
+        } else {
+            tree.remove_tab((node_i, tab_i));
+        }
+    } else {
+        tree.push_to_focused_leaf(tab);
+    }
 }

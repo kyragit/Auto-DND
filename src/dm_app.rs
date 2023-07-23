@@ -1,10 +1,10 @@
-use crate::map::{Map, Room};
+use crate::map::{Map, Room, RoomContainer, RoomTrap, RoomConnection};
 use crate::party::Party;
 use crate::{AppPreferences, WindowPreferences};
 use crate::character::{PlayerCharacter, SavingThrows, Attr, PlayerEquipSlot};
 use crate::class::{SavingThrowProgressionType, Class, ClassDamageBonus, Cleaves, HitDie, AttackThrowProgression, WeaponSelection, BroadWeapons, NarrowWeapons, RestrictedWeapons, ArmorSelection, THIEF_SKILLS};
-use crate::combat::{Fight, Owner, Combatant, CombatantStats, DamageRoll, PreRoundAction, TurnType, MovementAction, AttackAction, SpecialManeuver};
-use crate::common_ui::{self, CharacterSheetTab, back_arrow, stat_mod_i32_button, stat_mod_percent_button, ChatMessage, x_button, link_button, link_button_frameless, registry_viewer, enemy_viewer_callback};
+use crate::combat::{Fight, Owner, Combatant, CombatantStats, DamageRoll, PreRoundAction, TurnType, MovementAction, AttackAction, SpecialManeuver, StatusEffect};
+use crate::common_ui::*;
 use crate::dice::{ModifierType, Drop, DiceRoll, roll};
 use crate::enemy::{Enemy, EnemyType, EnemyHitDice, EnemyCategory, Alignment, AttackRoutine};
 use crate::item::{ItemType, Encumbrance, WeaponStats, WeaponDamage, MeleeDamage, ContainerStats, Item};
@@ -12,6 +12,7 @@ use crate::proficiency::{Proficiency, ProficiencyInstance};
 use crate::race::Race;
 use crate::spell::{Spell, MagicType, SpellRange, SpellDuration, SpellRegistry};
 use eframe::egui::{self, Ui, RichText, WidgetText, Color32};
+use egui::collapsing_header::CollapsingState;
 use egui::{Label, Sense, TextEdit, Id, Layout, Align};
 use egui::text::LayoutJob;
 use egui_dock::{DockArea, Tree, TabViewer};
@@ -293,8 +294,6 @@ pub struct SaveData {
     pub known_users: HashMap<String, String>,
     pub user_data: HashMap<String, UserData>,
     pub parties: HashMap<String, Party>,
-    pub fight: Option<Fight>,
-    pub deployed_enemies: HashMap<String, (EnemyType, Vec<Enemy>)>,
 }
 
 /// Information associated with a user, like their characters.
@@ -416,8 +415,6 @@ pub struct DMAppData {
     pub logs: Vec<LayoutJob>,
     pub streams: Vec<(TcpStream, Vec<u8>)>,
     pub temp_state: AppTempState,
-    pub fight: Option<Fight>,
-    pub deployed_enemies: HashMap<String, (EnemyType, Vec<Enemy>)>,
     pub enemy_type_registry: Registry<EnemyType>,
     pub item_type_registry: Registry<ItemType>,
     pub class_registry: Registry<Class>,
@@ -441,8 +438,6 @@ impl DMAppData {
             logs: Vec::new(),
             streams: Vec::new(),
             temp_state: AppTempState::new(),
-            fight: None,
-            deployed_enemies: HashMap::new(),
             enemy_type_registry: Registry::new(),
             item_type_registry: Registry::new(),
             class_registry: Registry::new(),
@@ -463,8 +458,6 @@ impl DMAppData {
                     self.known_users = data.known_users;
                     self.user_data = data.user_data;
                     self.parties = data.parties;
-                    self.fight = data.fight;
-                    self.deployed_enemies = data.deployed_enemies;
                 },
                 // backs up the existing save data if we couldn't deserialize it
                 Err(e) => {
@@ -593,8 +586,6 @@ impl DMAppData {
             known_users: self.known_users.clone(),
             user_data: self.user_data.clone(),
             parties: self.parties.clone(),
-            fight: self.fight.clone(),
-            deployed_enemies: self.deployed_enemies.clone(),
         };
         let save_data_str = ron::to_string(&save_data).unwrap();
         file.write_all(save_data_str.as_bytes()).unwrap();
@@ -603,6 +594,14 @@ impl DMAppData {
                 prefs.dm_window = Some(self.prefs.clone());
                 let _ = std::fs::write("preferences.ron", ron::to_string(&prefs).unwrap_or(s));
             }
+        }
+    }
+
+    /// Saves the currently loaded map to disc and unloads it.
+    pub fn save_and_unload_map(&mut self) {
+        if let Some((file, map)) = &self.loaded_map {
+            let _ = save_ron(map, "maps", file);
+            self.loaded_map = None;
         }
     }
 
@@ -686,15 +685,19 @@ impl DMAppData {
     pub fn get_combatant_stats<F, R>(&mut self, combatant: &Combatant, f: F) -> R 
     where F: FnOnce(Option<&mut CombatantStats>) -> R {
         match combatant {
-            Combatant::Enemy(type_id, id, _) => {
-                if let Some((_, group)) = self.deployed_enemies.get_mut(type_id) {
-                    if let Some(enemy) = group.get_mut(*id as usize) {
-                        return f(Some(&mut enemy.combat_stats));
+            Combatant::Enemy { room, type_id, index, display_name: _ } => {
+                if let Some((_, map)) = &mut self.loaded_map {
+                    if let Some(room) = map.rooms.get_mut(room) {
+                        if let Some((_, group)) = room.enemies.get_mut(type_id) {
+                            if let Some(enemy) = group.get_mut(*index) {
+                                return f(Some(&mut enemy.combat_stats));
+                            }
+                        }
                     }
                 }
                 f(None)
             },
-            Combatant::PC(user, name) => {
+            Combatant::PC { user, name } => {
                 if let Some(ud) = self.user_data.get_mut(user) {
                     if let Some(stats) = ud.characters.get_mut(name) {
                         return f(Some(&mut stats.combat_stats));
@@ -710,15 +713,19 @@ impl DMAppData {
     pub fn get_combatant_stats_alt<F, R>(&mut self, combatant: &Combatant, f: F) -> Option<R> 
     where F: FnOnce(&mut CombatantStats) -> R {
         match combatant {
-            Combatant::Enemy(type_id, id, _) => {
-                if let Some((_, group)) = self.deployed_enemies.get_mut(type_id) {
-                    if let Some(enemy) = group.get_mut(*id as usize) {
-                        return Some(f(&mut enemy.combat_stats));
+            Combatant::Enemy { room, type_id, index, display_name: _ } => {
+                if let Some((_, map)) = &mut self.loaded_map {
+                    if let Some(room) = map.rooms.get_mut(room) {
+                        if let Some((_, group)) = room.enemies.get_mut(type_id) {
+                            if let Some(enemy) = group.get_mut(*index) {
+                                return Some(f(&mut enemy.combat_stats));
+                            }
+                        }
                     }
                 }
                 None
             },
-            Combatant::PC(user, name) => {
+            Combatant::PC { user, name } => {
                 if let Some(ud) = self.user_data.get_mut(user) {
                     if let Some(stats) = ud.characters.get_mut(name) {
                         return Some(f(&mut stats.combat_stats));
@@ -731,7 +738,7 @@ impl DMAppData {
 
     /// If the combatant exists and is a player character, sends an update packet to the client.
     pub fn update_combatant(&mut self, combatant: &Combatant) {
-        if let Combatant::PC(user, name) = combatant {
+        if let Combatant::PC { user, name } = combatant {
             if let Some(user_data) = self.user_data.get(user) {
                 if let Some(sheet) = user_data.characters.get(name) {
                     self.send_to_user(ClientBoundPacket::UpdateCharacter(name.clone(), sheet.clone()), user.clone());
@@ -760,8 +767,11 @@ impl DMAppData {
         None
     }
 
-    /// If the character exists, passes it to the given closure.
-    pub fn apply_to_pc<R>(&mut self, user: impl Into<String>, name: impl Into<String>, mut func: impl FnMut(&mut PlayerCharacter) -> R) -> Option<R> {
+    /// If the character exists, passes it to the given function.
+    pub fn apply_to_pc<F, R>(&mut self, user: impl Into<String>, name: impl Into<String>, func: F) -> Option<R> 
+    where
+        F: FnOnce(&mut PlayerCharacter) -> R
+    {
         if let Some(user_data) = self.user_data.get_mut(&user.into()) {
             if let Some(sheet) = user_data.characters.get_mut(&name.into()) {
                 return Some(func(sheet));
@@ -770,8 +780,11 @@ impl DMAppData {
         None
     }
 
-    /// If the character exists, passes it to the given closure. Otherwise, returns the given default.
-    pub fn apply_to_pc_or<R>(&mut self, user: impl Into<String>, name: impl Into<String>, default: R, mut func: impl FnMut(&mut PlayerCharacter) -> R) -> R {
+    /// If the character exists, passes it to the given function. Otherwise, returns the given default.
+    pub fn apply_to_pc_or<F, R>(&mut self, user: impl Into<String>, name: impl Into<String>, default: R, func: F) -> R 
+    where 
+        F: FnOnce(&mut PlayerCharacter) -> R
+    {
         if let Some(user_data) = self.user_data.get_mut(&user.into()) {
             if let Some(sheet) = user_data.characters.get_mut(&name.into()) {
                 return func(sheet);
@@ -780,12 +793,28 @@ impl DMAppData {
         default
     }
 
-    pub fn get_chat_title(&self) -> WidgetText {
+    fn get_chat_title(&self) -> WidgetText {
         if self.temp_state.unread_messages == 0 || self.temp_state.unread_msg_buffer {
             format!("{}", ep::CHAT_TEXT).into()
         } else {
             RichText::new(format!("{}({})", ep::CHAT_TEXT, self.temp_state.unread_messages)).color(Color32::RED).into()
         }
+    }
+
+    /// Passes a mutable reference to the currently active `Fight` to the provided function, if it
+    /// exists.
+    /// ### Returns
+    /// Whatever the passed function returns, or `None` if there is no `Fight`.
+    pub fn get_fight<F, R>(&mut self, func: F) -> Option<R>
+    where 
+        F: FnOnce(&mut Fight) -> R 
+    {
+        if let Some((_, map)) = &mut self.loaded_map {
+            if let Some(fight) = &mut map.fight {
+                return Some(func(fight));
+            }
+        }
+        None
     }
 }
 
@@ -879,16 +908,10 @@ impl DMApp {
                     Self::open_or_focus(tree, DMTab::DiceRoller);
                     ui.close_menu();
                 }
-                ui.menu_button("Enemies", |ui| {
-                    if ui.button("Deployed Enemies").clicked() {
-                        Self::open_or_focus(tree, DMTab::DeployedEnemies);
-                        ui.close_menu();
-                    }
-                    if ui.button("Enemy Types").clicked() {
-                        Self::open_or_focus(tree, DMTab::EnemyViewer);
-                        ui.close_menu();
-                    }
-                });
+                if ui.button("Enemies").clicked() {
+                    Self::open_or_focus(tree, DMTab::EnemyViewer);
+                    ui.close_menu();
+                }
                 if ui.button("Items").clicked() {
                     Self::open_or_focus(tree, DMTab::ItemViewer);
                     ui.close_menu();
@@ -1202,6 +1225,117 @@ pub fn parse_command(data: &mut DMAppData, mut command: String) {
                     data.log(ChatMessage::no_sender("You must enter dice notation. Run /help roll for more info.").private().light_red());
                 }
             },
+            "say" => {
+                let mut message = ChatMessage::no_sender(String::new());                
+                while let Some(token) = tree.next() {
+                    match token {
+                        "-c" | "-color" => {
+                            if let Some(token) = tree.next() {
+                                let color = token.strip_prefix('#').unwrap_or(token);
+                                if color.len() != 6 {
+                                    data.log(ChatMessage::no_sender(format!("Token \"{}\" is not a valid color.", token)).private());
+                                    return;
+                                } else {
+                                    let red = u8::from_str_radix(color.get(0..=1).unwrap_or("??"), 16);
+                                    let green = u8::from_str_radix(color.get(2..=3).unwrap_or("??"), 16);
+                                    let blue = u8::from_str_radix(color.get(4..=5).unwrap_or("??"), 16);
+                                    if red.is_err() || green.is_err() || blue.is_err() {
+                                        data.log(ChatMessage::no_sender(format!("Token \"{}\" is not a valid color.", token)).private());
+                                        return;
+                                    }
+                                    message.color = Color32::from_rgb(red.unwrap(), green.unwrap(), blue.unwrap());
+                                }
+                            } else {
+                                data.log(ChatMessage::no_sender("You must provide a color hex code (e.g. #00FFAA).").private());
+                                return;
+                            }
+                        },
+                        "-u" | "-underline" => {
+                            message = message.underline();
+                        },
+                        "-s" | "-strikethrough" => {
+                            message = message.strikethrough();
+                        },
+                        "-i" | "-italics" => {
+                            message = message.italics();
+                        },
+                        "-size" => {
+                            if let Some(token) = tree.next() {
+                                if let Ok(mut size) = token.parse::<f32>() {
+                                    if size > 100.0 {
+                                        size = 100.0;
+                                    }
+                                    message = message.size(size);
+                                } else {
+                                    data.log(ChatMessage::no_sender(format!("Token \"{}\" could not be parsed as a number.", token)).private());
+                                    return;
+                                }
+                            } else {
+                                data.log(ChatMessage::no_sender("You must provide a size.").private());
+                                return;
+                            }
+                        },
+                        "-as" => {
+                            if let Some(token) = tree.next() {
+                                match token {
+                                    "server" => {
+                                        message.sender = MessageSender::Server;
+                                    },
+                                    t => {
+                                        message.sender = MessageSender::Player(t.to_owned());
+                                    },
+                                }
+                            } else {
+                                data.log(ChatMessage::no_sender("You must provide a user, or \"server\".").private());
+                                return;
+                            }
+                        },
+                        "-v" | "-valign" => {
+                            if let Some(token) = tree.next() {
+                                match token {
+                                    "top" | "min" | "above" => {
+                                        message.valign = Align::Min;
+                                    },
+                                    "center" | "centre" | "middle" => {
+                                        message.valign = Align::Center;
+                                    },
+                                    "bottom" | "max" | "below" => {
+                                        message.valign = Align::Max;
+                                    },
+                                    t => {
+                                        data.log(ChatMessage::no_sender(format!("Token \"{}\" could not be interpreted as a vertical alignment. Valid options are \"top\", \"center\", or\"bottom\".", t)).private());
+                                        return;
+                                    },
+                                }
+                            } else {
+                                data.log(ChatMessage::no_sender("You must provide a vertical alignment.").private());
+                                return;
+                            }
+                        },
+                        "-r" | "-roll" => {
+                            message = message.dice_roll();
+                        },
+                        "-o" | "-combat" => {
+                            message = message.combat();
+                        },
+                        "-p" | "-private" => {
+                            message = message.private();
+                        },
+                        "-a" | "-parties" => {
+                            message = message.parties();
+                        },
+                        t => {
+                            message.message = t.to_owned();
+                            break;
+                        },
+                    }
+                }
+                if message.message.is_empty() {
+                    data.log(ChatMessage::no_sender("You must provide text. Make sure to put it in \"quotes\".").private());
+                } else {
+                    data.log(message);
+                }
+            },
             "help" => {
                 if let Some(token) = tree.next() {
                     match token {
@@ -1269,9 +1403,9 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
                     data.temp_state.dice_roll.min_value = 1;
             }
             if data.temp_state.dice_roll_advanced {
-                common_ui::dice_roll_editor(ui, &mut data.temp_state.dice_roll);
+                dice_roll_editor(ui, &mut data.temp_state.dice_roll);
             } else {
-                common_ui::dice_roll_editor_simple(ui, &mut data.temp_state.dice_roll);
+                dice_roll_editor_simple(ui, &mut data.temp_state.dice_roll);
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -1325,13 +1459,13 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
                 for name in names {
                     ui.horizontal(|ui| {
                         self.open_tab_button(ui, format!("Character: {}", name), DMTab::PlayerCharacter(user.clone(), name.clone()), DMTab::Player(user.clone()));
-                        if let Some(fight) = &mut self.data.fight {
-                            if !fight.started {
-                                if ui.button("Add to fight").clicked() {
-                                    fight.combatants.insert((Owner::Player(user.clone()), Combatant::PC(user.clone(), name)));
-                                }
-                            }
-                        }
+                        // if let Some(fight) = &mut self.data.fight {
+                        //     if !fight.started {
+                        //         if ui.button("Add to fight").clicked() {
+                        //             fight.combatants.insert((Owner::Player(user.clone()), Combatant::pc(user.clone(), name)));
+                        //         }
+                        //     }
+                        // }
                     });
                 }
             } else {
@@ -1352,7 +1486,7 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
             if let Some(sheet) = user_data.characters.get_mut(name) {
                 let tab = user_data.charsheet_tabs.entry(name.clone()).or_insert(CharacterSheetTab::Stats);
                 let mut changed = false;
-                common_ui::tabs(tab, format!("<{}>_charsheet_tab_<{}>", user, name), ui, |_, _| {}, |ui, tab| {
+                tabs(tab, format!("<{}>_charsheet_tab_<{}>", user, name), ui, |_, _| {}, |ui, tab| {
                     match tab {
                         CharacterSheetTab::Stats => {
                             if let Some(party_name) = &sheet.party {
@@ -1933,66 +2067,6 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
         );
         data.temp_state.viewed_enemy = viewed;
     }
-    fn deployed_enemies(&mut self, ui: &mut Ui) {
-        let data = &mut *self.data;
-        if data.deployed_enemies.is_empty() {
-            ui.horizontal(|ui| {
-                ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
-                ui.label("There are currently no deployed enemies. Use the ");
-                if ui.link("enemy viewer").clicked() {
-                    (self.callback)(DMTab::EnemyViewer, true);
-                }
-                ui.label(" to deploy some!");
-            });
-        } else {
-            let mut remove = None;
-            for (id, (typ, group)) in &data.deployed_enemies {
-                for (n, enemy) in group.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        if n == 0 {
-                            ui.label(format!("{}: {}/{}", typ.name, enemy.combat_stats.health.current_hp, enemy.combat_stats.health.max_hp));
-                        } else {
-                            ui.label(format!("{} {}: {}/{}", typ.name, n + 1, enemy.combat_stats.health.current_hp, enemy.combat_stats.health.max_hp));
-                        }
-                        if link_button(ui) {
-                            data.temp_state.viewed_enemy = Some(id.clone());
-                            (self.callback)(DMTab::EnemyViewer, true);
-                        }
-                        if let Some(fight) = &mut data.fight {
-                            if fight.started && fight.current_turn.is_none() {
-                                ui.menu_button("Declare", |ui| {
-                                    if ui.button("Fighting Withdrawal").clicked() {
-                                        fight.declarations.insert(Combatant::Enemy(id.clone(), n as u32, typ.name.clone()), PreRoundAction::FightingWithdrawal);
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Full Retreat").clicked() {
-                                        fight.declarations.insert(Combatant::Enemy(id.clone(), n as u32, typ.name.clone()), PreRoundAction::FullRetreat);
-                                        ui.close_menu();
-                                    }
-                                });
-                            } else if !fight.started {
-                                if ui.button("Add to fight").clicked() {
-                                    fight.combatants.insert((Owner::DM, Combatant::Enemy(id.clone(), n as u32, typ.name.clone())));
-                                }
-                            }
-                        } else {
-                            if x_button(ui) {
-                                remove = Some((id.clone(), n));
-                            }
-                        }
-                    });
-                }
-            }
-            if let Some((id, n)) = remove {
-                if let Some((_, group)) = data.deployed_enemies.get_mut(&id) {
-                    group.remove(n);
-                    if group.is_empty() {
-                        data.deployed_enemies.remove(&id);
-                    }
-                }
-            }
-        }
-    }
     fn enemy_creator(ui: &mut Ui, data: &mut DMAppData) {
         if let Some(enemy) = &mut data.temp_state.temp_enemy_type {
             if ui.vertical(|ui| {
@@ -2017,7 +2091,7 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
                         ui.add(egui::Slider::new(modifier, -2..=2).text("Modifier").clamp_to_range(false));
                     },
                     EnemyHitDice::Special(roll) => {
-                        common_ui::dice_roll_editor_simple(ui, roll);
+                        dice_roll_editor_simple(ui, roll);
                     },
                 }
                 ui.separator();
@@ -2037,24 +2111,24 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
                 match &mut enemy.base_damage {
                     AttackRoutine::One(roll1) => {
                         ui.label("Damage roll:");
-                        common_ui::damage_roll_editor(ui, roll1);
+                        damage_roll_editor(ui, roll1);
                     },
                     AttackRoutine::Two(roll1, roll2) => {
                         ui.label("Damage roll (first):");
-                        common_ui::damage_roll_editor(ui, roll1);
+                        damage_roll_editor(ui, roll1);
                         ui.add_space(3.0);
                         ui.label("Damage roll (second):");
-                        common_ui::damage_roll_editor(ui, roll2);
+                        damage_roll_editor(ui, roll2);
                     },
                     AttackRoutine::Three(roll1, roll2, roll3) => {
                         ui.label("Damage roll (first):");
-                        common_ui::damage_roll_editor(ui, roll1);
+                        damage_roll_editor(ui, roll1);
                         ui.add_space(3.0);
                         ui.label("Damage roll (second):");
-                        common_ui::damage_roll_editor(ui, roll2);
+                        damage_roll_editor(ui, roll2);
                         ui.add_space(3.0);
                         ui.label("Damage roll (third):");
-                        common_ui::damage_roll_editor(ui, roll3);
+                        damage_roll_editor(ui, roll3);
                     },
                 }
                 ui.separator();
@@ -2338,22 +2412,22 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
                             ui.label("Damage:");
                             match melee {
                                 MeleeDamage::OneHanded(dmg) => {
-                                    common_ui::damage_roll_editor(ui, dmg);
+                                    damage_roll_editor(ui, dmg);
                                 },
                                 MeleeDamage::Versatile(dmg1, dmg2) => {
                                     ui.label("One-Handed:");
-                                    common_ui::damage_roll_editor(ui, dmg1);
+                                    damage_roll_editor(ui, dmg1);
                                     ui.label("Two-Handed:");
-                                    common_ui::damage_roll_editor(ui, dmg2);
+                                    damage_roll_editor(ui, dmg2);
                                 },
                                 MeleeDamage::TwoHanded(dmg) => {
-                                    common_ui::damage_roll_editor(ui, dmg);
+                                    damage_roll_editor(ui, dmg);
                                 },
                             }
                         },
                         WeaponDamage::Missile(missile, ammo) => {
                             ui.label("Damage:");
-                            common_ui::damage_roll_editor(ui, missile);
+                            damage_roll_editor(ui, missile);
                             ui.label("Ammo Type:");
                             ui.text_edit_singleline(ammo);
                         },
@@ -2835,185 +2909,124 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
             } 
         }
     }
-    fn class_viewer(ui: &mut Ui, data: &mut DMAppData) {
-        let mut go_back = false;
-        match &mut data.temp_state.viewed_class {
-            Some(path) => {
-                match data.class_registry.get(path) {
-                    Some(node) => {
-                        match node {
-                            RegistryNode::Value(class) => {
-                                ui.horizontal(|ui| {
-                                    if back_arrow(ui) {
-                                        go_back = true;
-                                    }
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.button("Edit").clicked() {
-                                            let mut profs = String::new();
-                                            for (i, (prof, specs)) in class.class_proficiencies.iter().enumerate() {
-                                                if i == 0 {
-                                                    profs.push_str(prof);
-                                                } else {
-                                                    profs.push_str(&format!(", {}", prof));
-                                                }
-                                                if let Some(specs) = specs {
-                                                    let mut specs_str = "(".to_owned();
-                                                    for (j, spec) in specs.iter().enumerate() {
-                                                        if j == 0 {
-                                                            specs_str.push_str(spec);
-                                                        } else {
-                                                            specs_str.push_str(&format!(", {}", spec));
-                                                        }
-                                                    }
-                                                    specs_str.push(')');
-                                                    profs.push_str(&specs_str);
-                                                }
-                                            }
-                                            data.temp_state.temp_class_profs = profs;
-                                            data.temp_state.temp_class = Some(class.clone());
-                                            data.temp_state.temp_class_filename = path.clone();
-                                            data.temp_state.window_states.insert("class_creator".to_owned(), true);
-                                        }
-                                    });
-                                });
-                                ui.separator();
-                                ui.heading(&class.name);
-                                ui.label(RichText::new(&class.description).weak().italics());
-                                ui.separator();
-                                ui.label(format!("Race: {}", class.race));
-                                let mut list = "Prime Requisite(s): ".to_owned();
-                                for (i, attr) in class.prime_reqs.iter().enumerate() {
-                                    if i == 0 {
-                                        list.push_str(&format!("{}", attr));
-                                    } else {
-                                        list.push_str(&format!(", {}", attr));
-                                    }
-                                }
-                                ui.label(list);
-                                ui.label(format!("Maximum Level: {}", class.maximum_level));
-                                ui.label(format!("Hit Die: {}", class.hit_die));
-                                ui.label(format!("XP to 2nd level: {}", class.base_xp_cost));
-                                ui.separator();
-                                ui.add_space(3.0);
-                                ui.label(class.fighting_styles.display(&class.name));
-                                ui.add_space(3.0);
-                                ui.label(class.weapon_selection.display());
-                                ui.add_space(3.0);
-                                ui.label(class.armor_selection.display());
-                                match class.class_damage_bonus {
-                                    ClassDamageBonus::Both => {
-                                        ui.add_space(3.0);
-                                        ui.label(format!("The {} class deals +1 damage at level 1, and another +1 every third level.", class.name));
-                                    },
-                                    ClassDamageBonus::MeleeOnly => {
-                                        ui.add_space(3.0);
-                                        ui.label(format!("The {} class deals +1 melee damage at level 1, and another +1 every third level.", class.name));
-                                    },
-                                    ClassDamageBonus::MissileOnly => {
-                                        ui.add_space(3.0);
-                                        ui.label(format!("The {} class deals +1 missile (ranged) damage at level 1, and another +1 every third level.", class.name));
-                                    },
-                                    _ => {},
-                                }
-                                match class.cleaves {
-                                    Cleaves::Full => {
-                                        ui.add_space(3.0);
-                                        ui.label("They may cleave once per level of experience.");
-                                    },
-                                    Cleaves::Half => {
-                                        ui.add_space(3.0);
-                                        ui.label("They may cleave once per half their level, rounded down.");
-                                    },
-                                    _ => {},
-                                }
-                                if !class.thief_skills.0.is_empty() {
-                                    ui.add_space(3.0);
-                                    ui.label(class.thief_skills.display(&class.name));
-                                }
-                                ui.separator();
-                                ui.label("Class Proficiencies:");
-                                let mut list = String::new();
-                                for (i, (prof, specs)) in class.class_proficiencies.iter().enumerate() {
-                                    if let Some(prof) = data.proficiency_registry.get(prof) {
-                                        if i == 0 {
-                                            list.push_str(&prof.name);
-                                        } else {
-                                            list.push_str(&format!(", {}", prof.name));
-                                        }
-                                        if let Some(specs) = specs {
-                                            list.push('(');
-                                            for (j, spec) in specs.iter().enumerate() {
-                                                if j == 0 {
-                                                    list.push_str(spec);
-                                                } else {
-                                                    list.push_str(&format!(", {}", spec));
-                                                }
-                                            }
-                                            list.push(')');
-                                        }
-                                    }
-                                }
-                                ui.label(list);
-                            },
-                            RegistryNode::SubRegistry(map) => {
-                                ui.horizontal(|ui| {
-                                    if back_arrow(ui) {
-                                        go_back = true;
-                                    }
-                                });
-                                ui.separator();
-                                if map.is_empty() {
-                                    ui.label(RichText::new("There\'s nothing here...").weak().italics());
-                                }
-                                for (subpath, subnode) in map {
-                                    match subnode {
-                                        RegistryNode::Value(class) => {
-                                            if ui.button(format!("View: {}", class.name)).clicked() {
-                                                path.push_str("/");
-                                                path.push_str(subpath);
-                                            }
-                                        },
-                                        RegistryNode::SubRegistry(_) => {
-                                            if ui.button(format!("Folder: {}", subpath)).clicked() {
-                                                path.push_str("/");
-                                                path.push_str(subpath);
-                                            }
-                                        },
-                                    }
-                                }
-                            },
+    fn class_viewer(&mut self, ui: &mut Ui) {
+        let data = &mut *self.data;
+        let (viewed, _, _) = registry_viewer(
+            ui,
+            &data.class_registry,
+            data.temp_state.viewed_class.clone(),
+            |c| format!("View: {}", c.name).into(),
+            |_| None,
+            || None,
+            |ui, path, class| {
+                if ui.button("Edit").clicked() {
+                    let mut profs = String::new();
+                    for (i, (prof, specs)) in class.class_proficiencies.iter().enumerate() {
+                        if i == 0 {
+                            profs.push_str(prof);
+                        } else {
+                            profs.push_str(&format!(", {}", prof));
                         }
-                    },
-                    None => {
-                        data.temp_state.viewed_class = None;
-                    },
+                        if let Some(specs) = specs {
+                            let mut specs_str = "(".to_owned();
+                            for (j, spec) in specs.iter().enumerate() {
+                                if j == 0 {
+                                    specs_str.push_str(spec);
+                                } else {
+                                    specs_str.push_str(&format!(", {}", spec));
+                                }
+                            }
+                            specs_str.push(')');
+                            profs.push_str(&specs_str);
+                        }
+                    }
+                    data.temp_state.temp_class_profs = profs;
+                    data.temp_state.temp_class = Some(class.clone());
+                    data.temp_state.temp_class_filename = path.clone();
+                    (self.callback)(DMTab::ClassCreator, true);
                 }
             },
-            None => {
-                if data.class_registry.tree.is_empty() {
-                    ui.label(RichText::new("There\'s nothing here...").weak().italics());
-                }
-                for (path, node) in &data.class_registry.tree {
-                    match node {
-                        RegistryNode::Value(class) => {
-                            if ui.button(format!("View: {}", class.name)).clicked() {
-                                data.temp_state.viewed_class = Some(path.clone());
-                            }
-                        },
-                        RegistryNode::SubRegistry(_) => {
-                            if ui.button(format!("Folder: {}", path)).clicked() {
-                                data.temp_state.viewed_class = Some(path.clone());
-                            }
-                        },
+            |ui, _, class| {
+                ui.heading(&class.name);
+                ui.label(RichText::new(&class.description).weak().italics());
+                ui.separator();
+                ui.label(format!("Race: {}", class.race));
+                let mut list = "Prime Requisite(s): ".to_owned();
+                for (i, attr) in class.prime_reqs.iter().enumerate() {
+                    if i == 0 {
+                        list.push_str(&format!("{}", attr));
+                    } else {
+                        list.push_str(&format!(", {}", attr));
                     }
                 }
+                ui.label(list);
+                ui.label(format!("Maximum Level: {}", class.maximum_level));
+                ui.label(format!("Hit Die: {}", class.hit_die));
+                ui.label(format!("XP to 2nd level: {}", class.base_xp_cost));
+                ui.separator();
+                ui.add_space(3.0);
+                ui.label(class.fighting_styles.display(&class.name));
+                ui.add_space(3.0);
+                ui.label(class.weapon_selection.display());
+                ui.add_space(3.0);
+                ui.label(class.armor_selection.display());
+                match class.class_damage_bonus {
+                    ClassDamageBonus::Both => {
+                        ui.add_space(3.0);
+                        ui.label(format!("The {} class deals +1 damage at level 1, and another +1 every third level.", class.name));
+                    },
+                    ClassDamageBonus::MeleeOnly => {
+                        ui.add_space(3.0);
+                        ui.label(format!("The {} class deals +1 melee damage at level 1, and another +1 every third level.", class.name));
+                    },
+                    ClassDamageBonus::MissileOnly => {
+                        ui.add_space(3.0);
+                        ui.label(format!("The {} class deals +1 missile (ranged) damage at level 1, and another +1 every third level.", class.name));
+                    },
+                    _ => {},
+                }
+                match class.cleaves {
+                    Cleaves::Full => {
+                        ui.add_space(3.0);
+                        ui.label("They may cleave once per level of experience.");
+                    },
+                    Cleaves::Half => {
+                        ui.add_space(3.0);
+                        ui.label("They may cleave once per half their level, rounded down.");
+                    },
+                    _ => {},
+                }
+                if !class.thief_skills.0.is_empty() {
+                    ui.add_space(3.0);
+                    ui.label(class.thief_skills.display(&class.name));
+                }
+                ui.separator();
+                ui.label("Class Proficiencies:");
+                let mut list = String::new();
+                for (i, (prof, specs)) in class.class_proficiencies.iter().enumerate() {
+                    if let Some(prof) = data.proficiency_registry.get(prof) {
+                        if i == 0 {
+                            list.push_str(&prof.name);
+                        } else {
+                            list.push_str(&format!(", {}", prof.name));
+                        }
+                        if let Some(specs) = specs {
+                            list.push('(');
+                            for (j, spec) in specs.iter().enumerate() {
+                                if j == 0 {
+                                    list.push_str(spec);
+                                } else {
+                                    list.push_str(&format!(", {}", spec));
+                                }
+                            }
+                            list.push(')');
+                        }
+                    }
+                }
+                ui.label(list);
             },
-        }
-        if go_back {
-            if let Some(path) = &mut data.temp_state.viewed_class {
-                data.temp_state.viewed_class = path.rsplit_once("/").map(|(s, _)| s.to_owned());
-            }
-        }
+        );
+        data.temp_state.viewed_class = viewed;
     }
     fn class_creator(ui: &mut Ui, data: &mut DMAppData) {
         if let Some(class) = &mut data.temp_state.temp_class {
@@ -3311,286 +3324,310 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
     }
     fn combat(&mut self, ui: &mut Ui) {
         let data = &mut *self.data;
-        if let Some(fight) = &mut data.fight {
-            if fight.started {
-                let mut fight = fight.clone();
-                if let Some((turn, turn_type)) = &mut fight.current_turn {
-                    ui.label("Turn order:");
-                    for (i, (_, ctype, _)) in fight.turn_order.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if i == *turn {
-                                ui.label(RichText::new(format!("- {} ({})", ctype.name(), turn_type)).strong());
-                            } else {
-                                ui.label(format!("- {}", ctype.name()));
-                            }
-                            if ui.small_button(format!("{}", egui_phosphor::ARROW_SQUARE_OUT)).clicked() {
-                                match ctype {
-                                    Combatant::Enemy(id, _, _) => {
-                                        data.temp_state.viewed_enemy = Some(id.clone());
-                                        (self.callback)(DMTab::EnemyViewer, true);
-                                    },
-                                    Combatant::PC(user, name) => {
-                                        (self.callback)(DMTab::PlayerCharacter(user.clone(), name.clone()), true);
-                                    },
+        let fight_cloned: Option<Fight>;
+        match &mut data.loaded_map {
+            Some((_, map)) => {
+                let map_name = map.name.clone();
+                let mut maybe_fight = map.fight.clone();
+                let mut end_combat = false;
+                match &mut maybe_fight {
+                    Some(fight) => {
+                        if fight.started {
+                            if let Some((turn, turn_type)) = &mut fight.current_turn {
+                                ui.label("Turn order:");
+                                for (i, (_, comb, _)) in fight.turn_order.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        if i == *turn {
+                                            ui.label(RichText::new(format!("- {} ({})", comb, turn_type)).strong());
+                                        } else {
+                                            ui.label(format!("- {}", comb));
+                                        }
+                                        if link_button_frameless(ui) {
+                                            match comb {
+                                                Combatant::Enemy { room, .. } => {
+                                                    (self.callback)(DMTab::MapViewer, true);
+                                                    tree_callback(&mut self.map_tree, MapTab::RoomEnemies(room.clone()), true);
+                                                },
+                                                Combatant::PC { user, name } => {
+                                                    (self.callback)(DMTab::PlayerCharacter(user.clone(), name.clone()), true);
+                                                },
+                                            }
+                                        }
+                                    });
                                 }
-                            }
-                        });
-                    }
-                    ui.separator();
-                    if let Some((owner, ctype, declaration)) = fight.turn_order.get(*turn) {
-                        ui.label(format!("It is {}'s turn.", ctype.name()));
-                        match declaration {
-                            PreRoundAction::FightingWithdrawal => {
-                                ui.label("Remember, they declared a fighting withdrawal.");
-                            },
-                            PreRoundAction::FullRetreat => {
-                                ui.label("Remember, they declared a full retreat.");
-                            },
-                            PreRoundAction::CastSpell(id, lvl, mt) => {
-                                ui.label(format!("Remember, they declared that they are casting {}.", data.spell_registry.get_spell_name_or(id, *lvl, *mt, "Nonexistent Spell")));
-                            },
-                            PreRoundAction::None => {},
-                        }
-                        match turn_type {
-                            TurnType::Movement {action, player_action} => {
-                                let mut act = false;
-                                let mut deny: Option<String> = None;
-                                if let Owner::Player(player) = owner {
-                                    if let Some(player_action) = player_action {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("{} wants to: {}. Is this allowed? You can act for them if it isn't.", player, player_action));
-                                            if ui.small_button(RichText::new(format!("{}", ep::CHECK)).color(Color32::GREEN)).on_hover_text("Approve").clicked() {
-                                                *action = player_action.clone();
-                                                act = true;
+                                ui.separator();
+                                if let Some((owner, comb, declaration)) = fight.turn_order.get(*turn) {
+                                    ui.label(format!("It is {}'s turn.", comb));
+                                    match declaration {
+                                        PreRoundAction::FightingWithdrawal => {
+                                            ui.label("Remember, they declared a fighting withdrawal.");
+                                        },
+                                        PreRoundAction::FullRetreat => {
+                                            ui.label("Remember, they declared a full retreat.");
+                                        },
+                                        PreRoundAction::CastSpell(id, lvl, mt) => {
+                                            ui.label(format!("Remember, they declared that they are casting {}.", data.spell_registry.get_spell_name_or(id, *lvl, *mt, "Nonexistent Spell")));
+                                        },
+                                        PreRoundAction::None => {},
+                                    }
+                                    match turn_type {
+                                        TurnType::Movement { action, player_action } => {
+                                            let mut act = false;
+                                            let mut deny: Option<String> = None;
+                                            if let Owner::Player(player) = owner {
+                                                if let Some(player_action) = player_action {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(format!("{} wants to: {}. Is this allowed? You can act for them if it isn't.", player, player_action));
+                                                        if ui.small_button(RichText::new(format!("{}", ep::CHECK)).color(Color32::GREEN)).on_hover_text("Approve").clicked() {
+                                                            *action = player_action.clone();
+                                                            act = true;
+                                                        }
+                                                        if ui.small_button(RichText::new(format!("{}", ep::COPY)).color(Color32::YELLOW)).on_hover_text("Modify").clicked() {
+                                                            *action = player_action.clone();
+                                                        }
+                                                        if ui.small_button(RichText::new(format!("{}", ep::X)).color(Color32::RED)).on_hover_text("Deny").clicked() {
+                                                            deny = Some(player.clone());
+                                                        }
+                                                    });
+                                                } else {
+                                                    ui.label(format!("{} has not chosen an action yet.", player));
+                                                }
+                                                ui.separator();
                                             }
-                                            if ui.small_button(RichText::new(format!("{}", ep::COPY)).color(Color32::YELLOW)).on_hover_text("Modify").clicked() {
-                                                *action = player_action.clone();
+                                            egui::ComboBox::from_label("Movement Action")
+                                                .selected_text(action.to_string())
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(action, MovementAction::None, "None");
+                                                    ui.selectable_value(action, MovementAction::Move, "Move");
+                                                    ui.selectable_value(action, MovementAction::Run, "Run");
+                                                    ui.selectable_value(action, MovementAction::Charge, "Charge");
+                                                    ui.selectable_value(action, MovementAction::FightingWithdrawal, "Fighting Withdrawal");
+                                                    ui.selectable_value(action, MovementAction::FullRetreat, "Full Retreat");
+                                                    ui.selectable_value(action, MovementAction::SimpleAction, "Simple Action");
+                                                });
+                                            if let Some(player) = deny {
+                                                *player_action = None;
+                                                fight.update_specific_client(data, player);
+                                            } 
+                                            if ui.button("Act").clicked() || act {
+                                                fight.resolve_action(data);
                                             }
-                                            if ui.small_button(RichText::new(format!("{}", ep::X)).color(Color32::RED)).on_hover_text("Deny").clicked() {
-                                                deny = Some(player.clone());
+                                        },
+                                        TurnType::Attack { action, player_action } => {
+                                            let mut act = false;
+                                            let mut deny: Option<String> = None;
+                                            if let Owner::Player(player) = owner {
+                                                if let Some(player_action) = player_action {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(format!("{} wants to: {}. Is this allowed? You can act for them if it isn't.", player, player_action.display_alt()));
+                                                        if ui.small_button(RichText::new(format!("{}", ep::CHECK)).color(Color32::GREEN)).on_hover_text("Approve").clicked() {
+                                                            *action = player_action.clone();
+                                                            act = true;
+                                                        }
+                                                        if ui.small_button(RichText::new(format!("{}", ep::COPY)).color(Color32::YELLOW)).on_hover_text("Modify").clicked() {
+                                                            *action = player_action.clone();
+                                                        }
+                                                        if ui.small_button(RichText::new(format!("{}", ep::X)).color(Color32::RED)).on_hover_text("Deny").clicked() {
+                                                            deny = Some(player.clone());
+                                                        }
+                                                    });
+                                                } else {
+                                                    ui.label(format!("{} has not chosen an action yet.", player));
+                                                }
+                                                ui.separator();
+                                            }
+                                            egui::ComboBox::from_label("Attack Action")
+                                                .selected_text(action.to_string())
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(action, AttackAction::None, "None");
+                                                    ui.selectable_value(action, AttackAction::Attack(comb.clone(), 0), "Attack");
+                                                    ui.selectable_value(action, AttackAction::SpecialManeuver(comb.clone(), SpecialManeuver::Disarm, 0), "Special Maneuver");
+                                                    ui.selectable_value(action, AttackAction::CastSpell, "Cast Spell");
+                                                    ui.selectable_value(action, AttackAction::OtherAction, "Other Action");
+                                                });
+                                            match action {
+                                                AttackAction::Attack(target, modifier) => {
+                                                    egui::ComboBox::from_label("Target")
+                                                        .selected_text(target.to_string())
+                                                        .show_ui(ui, |ui| {
+                                                            for (_, t, _) in &fight.turn_order {
+                                                                ui.selectable_value(target, t.clone(), t.to_string());
+                                                            }
+                                                        });
+                                                    egui::ComboBox::from_label("Situational Modifier")
+                                                        .selected_text(format!("{:+}", modifier))
+                                                        .show_ui(ui, |ui| {
+                                                            ui.selectable_value(modifier, -4, "Blind");
+                                                            ui.add(egui::DragValue::new(modifier).prefix("Custom:"));
+                                                        });
+                                                },
+                                                AttackAction::SpecialManeuver(target, maneuver, _modifier) => {
+                                                    egui::ComboBox::from_label("Target")
+                                                        .selected_text(target.to_string())
+                                                        .show_ui(ui, |ui| {
+                                                            for (_, t, _) in &fight.turn_order {
+                                                                ui.selectable_value(target, t.clone(), t.to_string());
+                                                            }
+                                                        });
+                                                    egui::ComboBox::from_label("Maneuver")
+                                                        .selected_text(maneuver.to_string())
+                                                        .show_ui(ui, |ui| {
+                                                            ui.selectable_value(maneuver, SpecialManeuver::Disarm, "Disarm");
+                                                            ui.selectable_value(maneuver, SpecialManeuver::ForceBack, "Force Back");
+                                                            ui.selectable_value(maneuver, SpecialManeuver::Incapacitate, "Incapacitate");
+                                                            ui.selectable_value(maneuver, SpecialManeuver::KnockDown, "Knock Down");
+                                                            ui.selectable_value(maneuver, SpecialManeuver::Sunder, "Sunder");
+                                                            ui.selectable_value(maneuver, SpecialManeuver::Wrestle, "Wrestle");
+                                                        });
+                                                },
+                                                _ => {},
+                                            }
+                                            if let Some(player) = deny {
+                                                *player_action = None;
+                                                fight.update_specific_client(data, player);
+                                            } 
+                                            if ui.button("Act").clicked() || act {
+                                                fight.resolve_action(data);
+                                            }
+                                        },
+                                    }
+                                } else {
+                                    ui.colored_label(Color32::RED, "Something has gone horribly wrong.");
+                                }
+                            } else {
+                                ui.vertical(|ui| {
+                                    ui.label("Initiative has not been calculated yet. Any pre-round declarations are listed (right-click to deny):");
+                                    ui.add_space(4.0);
+                                    let mut maybe_remove = None;
+                                    for (comb, action) in &fight.declarations {
+                                        let res = if let PreRoundAction::CastSpell(id, lvl, magic_type) = action {
+                                            let name = match magic_type {
+                                                MagicType::Arcane => {
+                                                    data.spell_registry.arcane.get(*lvl as usize).and_then(|reg| reg.get(id).map(|s| s.name.as_str()))
+                                                },
+                                                MagicType::Divine => {
+                                                    data.spell_registry.divine.get(*lvl as usize).and_then(|reg| reg.get(id).map(|s| s.name.as_str()))
+                                                },
+                                            };
+                                            ui.horizontal(|ui| {
+                                                let res = ui.add(Label::new(format!("- {}: Cast Spell ({})", comb, name.unwrap_or("Nonexistent spell"))).sense(Sense::click()));
+                                                if ui.small_button(format!("{}", ep::ARROW_SQUARE_OUT)).clicked() {
+                                                    data.temp_state.viewed_spell = Some((*magic_type, Some((*lvl, Some(id.clone())))));
+                                                    (self.callback)(DMTab::SpellViewer, true);
+                                                }
+                                                res
+                                            }).inner
+                                        } else {
+                                            ui.add(Label::new(format!("- {}: {}", comb, action)).sense(Sense::click()))
+                                        };
+                                        res.context_menu(|ui| {
+                                            if ui.button("Deny").clicked() {
+                                                maybe_remove = Some(comb.clone());
+                                                ui.close_menu();
                                             }
                                         });
-                                    } else {
-                                        ui.label(format!("{} has not chosen an action yet.", player));
+                                    }
+                                    if let Some(typ) = maybe_remove {
+                                        fight.declarations.remove(&typ);
                                     }
                                     ui.separator();
-                                }
-                                egui::ComboBox::from_label("Movement Action")
-                                    .selected_text(action.to_string())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(action, MovementAction::None, "None");
-                                        ui.selectable_value(action, MovementAction::Move, "Move");
-                                        ui.selectable_value(action, MovementAction::Run, "Run");
-                                        ui.selectable_value(action, MovementAction::Charge, "Charge");
-                                        ui.selectable_value(action, MovementAction::FightingWithdrawal, "Fighting Withdrawal");
-                                        ui.selectable_value(action, MovementAction::FullRetreat, "Full Retreat");
-                                        ui.selectable_value(action, MovementAction::SimpleAction, "Simple Action");
-                                    });
-                                if let Some(player) = deny {
-                                    *player_action = None;
-                                    fight.update_specific_client(data, player);
-                                } 
-                                if ui.button("Act").clicked() || act {
-                                    fight.resolve_action(data);
-                                }
-                            },
-                            TurnType::Attack {action, player_action} => {
-                                let mut act = false;
-                                let mut deny: Option<String> = None;
-                                if let Owner::Player(player) = owner {
-                                    if let Some(player_action) = player_action {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("{} wants to: {}. Is this allowed? You can act for them if it isn't.", player, player_action.display_alt()));
-                                            if ui.small_button(RichText::new(format!("{}", ep::CHECK)).color(Color32::GREEN)).on_hover_text("Approve").clicked() {
-                                                *action = player_action.clone();
-                                                act = true;
-                                            }
-                                            if ui.small_button(RichText::new(format!("{}", ep::COPY)).color(Color32::YELLOW)).on_hover_text("Modify").clicked() {
-                                                *action = player_action.clone();
-                                            }
-                                            if ui.small_button(RichText::new(format!("{}", ep::X)).color(Color32::RED)).on_hover_text("Deny").clicked() {
-                                                deny = Some(player.clone());
-                                            }
-                                        });
-                                    } else {
-                                        ui.label(format!("{} has not chosen an action yet.", player));
+                                    if ui.button("Calculate initiative").clicked() {
+                                        fight.start_round(data);
                                     }
-                                    ui.separator();
+                                });
+                            }
+                            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                                if ui.button("End combat").clicked() {
+                                    data.log(ChatMessage::no_sender(format!("Combat has concluded in {}!", map_name)).combat());
+                                    data.send_to_all_players(ClientBoundPacket::UpdateCombatState(None));
+                                    end_combat = true;
                                 }
-                                egui::ComboBox::from_label("Attack Action")
-                                    .selected_text(action.to_string())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(action, AttackAction::None, "None");
-                                        ui.selectable_value(action, AttackAction::Attack(ctype.clone(), 0), "Attack");
-                                        ui.selectable_value(action, AttackAction::SpecialManeuver(ctype.clone(), SpecialManeuver::Disarm, 0), "Special Maneuver");
-                                        ui.selectable_value(action, AttackAction::CastSpell, "Cast Spell");
-                                        ui.selectable_value(action, AttackAction::OtherAction, "Other Action");
-                                    });
-                                match action {
-                                    AttackAction::Attack(target, modifier) => {
-                                        egui::ComboBox::from_label("Target")
-                                            .selected_text(target.name())
-                                            .show_ui(ui, |ui| {
-                                                for (_, t, _) in &fight.turn_order {
-                                                    ui.selectable_value(target, t.clone(), t.name());
+                            });
+                        } else {
+                            ui.label("The fight has not started.");
+                            ui.menu_button("Add combatants...", |ui| {
+                                ui.menu_button("Enemies", |ui| {
+                                    for (room_id, room) in &map.rooms {
+                                        if ui.button(format!("Room {}", room_id)).clicked() {
+                                            for (type_id, (typ, group)) in &room.enemies {
+                                                for (i, _) in group.iter().enumerate() {
+                                                    fight.combatants.insert((Owner::DM, Combatant::enemy_auto_name(room_id.clone(), type_id.clone(), i, typ.name.clone())));
                                                 }
-                                            });
-                                        egui::ComboBox::from_label("Situational Modifier")
-                                            .selected_text(format!("{:+}", modifier))
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(modifier, -4, "Blind");
-                                                ui.add(egui::DragValue::new(modifier).prefix("Custom:"));
-                                            });
-                                    },
-                                    AttackAction::SpecialManeuver(target, maneuver, _modifier) => {
-                                        egui::ComboBox::from_label("Target")
-                                            .selected_text(target.name())
-                                            .show_ui(ui, |ui| {
-                                                for (_, t, _) in &fight.turn_order {
-                                                    ui.selectable_value(target, t.clone(), t.name());
-                                                }
-                                            });
-                                        egui::ComboBox::from_label("Maneuver")
-                                            .selected_text(maneuver.to_string())
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(maneuver, SpecialManeuver::Disarm, "Disarm");
-                                                ui.selectable_value(maneuver, SpecialManeuver::ForceBack, "Force Back");
-                                                ui.selectable_value(maneuver, SpecialManeuver::Incapacitate, "Incapacitate");
-                                                ui.selectable_value(maneuver, SpecialManeuver::KnockDown, "Knock Down");
-                                                ui.selectable_value(maneuver, SpecialManeuver::Sunder, "Sunder");
-                                                ui.selectable_value(maneuver, SpecialManeuver::Wrestle, "Wrestle");
-                                            });
-                                    },
-                                    _ => {},
-                                }
-                                if let Some(player) = deny {
-                                    *player_action = None;
-                                    fight.update_specific_client(data, player);
-                                } 
-                                if ui.button("Act").clicked() || act {
-                                    fight.resolve_action(data);
-                                }
-                            },
-                        }
-                    } else {
-                        ui.colored_label(Color32::RED, "Something has gone horribly wrong.");
-                    }
-                } else {
-                    ui.vertical(|ui| {
-                        ui.label("Initiative has not been calculated yet. Any pre-round declarations are listed (right-click to deny):");
-                        ui.add_space(4.0);
-                        let mut maybe_remove = None;
-                        for (typ, action) in &fight.declarations {
-                            let res = if let PreRoundAction::CastSpell(id, lvl, magic_type) = action {
-                                let name = match magic_type {
-                                    MagicType::Arcane => {
-                                        data.spell_registry.arcane.get(*lvl as usize).and_then(|reg| reg.get(id).map(|s| s.name.as_str()))
-                                    },
-                                    MagicType::Divine => {
-                                        data.spell_registry.divine.get(*lvl as usize).and_then(|reg| reg.get(id).map(|s| s.name.as_str()))
-                                    },
-                                };
-                                ui.horizontal(|ui| {
-                                    let res = ui.add(Label::new(format!("- {}: Cast Spell ({})", typ.name(), name.unwrap_or("Nonexistent spell"))).sense(Sense::click()));
-                                    if ui.small_button(format!("{}", ep::ARROW_SQUARE_OUT)).clicked() {
-                                        data.temp_state.viewed_spell = Some((*magic_type, Some((*lvl, Some(id.clone())))));
-                                        (self.callback)(DMTab::SpellViewer, true);
+                                            }
+                                            ui.close_menu();
+                                        }
                                     }
-                                    res
-                                }).inner
-                            } else {
-                                ui.add(Label::new(format!("- {}: {}", typ.name(), action)).sense(Sense::click()))
-                            };
-                            res.context_menu(|ui| {
-                                if ui.button("Deny").clicked() {
-                                    maybe_remove = Some(typ.clone());
-                                    ui.close_menu();
+                                });
+                                ui.menu_button("Parties", |ui| {
+                                    for (name, party) in &data.parties {
+                                        if ui.button(RichText::new(name).color(party.color)).clicked() {
+                                            for (user, name) in &party.members {
+                                                fight.combatants.insert((Owner::Player(user.clone()), Combatant::pc(user.clone(), name.clone())));
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            });
+                            ui.separator();
+                            ui.label(RichText::new("Combatants").size(15.0));
+                            ui.indent("combatants", |ui| {
+                                let mut remove = None;
+                                for (owner, combatant) in &fight.combatants {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("- {}", combatant));
+                                        if trash_button_frameless(ui) {
+                                            remove = Some((owner, combatant));
+                                        }
+                                    });
+                                }
+                                if let Some((o, c)) = remove {
+                                    fight.combatants.remove(&(o.clone(), c.clone()));
+                                }
+                                if fight.combatants.is_empty() {
+                                    ui.label(RichText::new("There's nothing here...").weak().italics());
+                                }
+                            });
+                            ui.separator();
+                            if ui.button("Start!").clicked() {
+                                data.log(ChatMessage::no_sender(format!("Combat has broken out in {}!", map_name)).combat());
+                                fight.started = true;
+                                fight.update_clients(data);
+                            }
+                            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                                if ui.button("End combat").clicked() {
+                                    end_combat = true;
                                 }
                             });
                         }
-                        if let Some(typ) = maybe_remove {
-                            fight.declarations.remove(&typ);
+                    },
+                    None => {
+                        ui.label(format!("There is currently no fight in {}.", map.name));
+                        if ui.button("Create fight").clicked() {
+                            maybe_fight = Some(Fight::new());
                         }
-                        ui.separator();
-                        if ui.button("Calculate initiative").clicked() {
-                            fight.start_round(data);
-                        }
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                            ui.label("You can use the ");
-                            if ui.link("deployed enemies tab").clicked() {
-                                (self.callback)(DMTab::DeployedEnemies, true);
-                            }
-                            ui.label(" to make declarations.");
-                        });
-                    });
+                    },
                 }
-
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    ui.add_space(2.0);
-                    if ui.button("End combat").clicked() {
-                        data.log(ChatMessage::no_sender("Combat has concluded!").combat());
-                        data.fight = None;
-                        data.send_to_all_players(ClientBoundPacket::UpdateCombatState(None));
-                    } else {
-                        data.fight = Some(fight);
-                    }
-                });
-            } else {
-                let mut fight = fight.clone();
-                ui.vertical_centered(|ui| {
-                    ui.label("The fight has not started yet. Use the deployed enemies window and the users window to add combatants, or use the buttons below.");
-                    ui.separator();
-                    ui.label("Combatants:");
-                    let mut maybe_remove = None;
-                    for (owner, ctype) in &fight.combatants {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("- {} ({})", ctype.name(), match owner {
-                                Owner::DM => "DM",
-                                Owner::Player(p) => p,
-                            }));
-                            if ui.small_button(RichText::new(format!("{}", ep::X)).color(Color32::RED)).clicked() {
-                                maybe_remove = Some((owner.clone(), ctype.clone()));
-                            }
-                        });
-                    }
-                    if let Some(c) = maybe_remove {
-                        fight.combatants.remove(&c);
-                    }
-                    ui.separator();
-                    if ui.button("Add all deployed enemies").clicked() {
-                        for (id, (typ, group)) in &data.deployed_enemies {
-                            for (i, _) in group.iter().enumerate() {
-                                fight.combatants.insert((Owner::DM, Combatant::Enemy(id.clone(), i as u32, typ.name.clone())));
-                            }
-                        }
-                    }
-                    if ui.button("Add all player characters").clicked() {
-                        for (user, _) in &data.connected_users {
-                            if let Some(user_data) = data.user_data.get(user) {
-                                for (name, _) in &user_data.characters {
-                                    fight.combatants.insert((Owner::Player(user.clone()), Combatant::PC(user.clone(), name.clone())));
-                                }
-                            }
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("Start!").clicked() {
-                        fight.started = true;
-                        data.log(ChatMessage::no_sender("Combat has broken out!").combat());
-                        fight.update_clients(data);
-                    }
-                });
-                data.fight = Some(fight);
-            }
-        } else {
-            ui.vertical_centered(|ui| {
-                ui.label("There is currently no active combat.");
-                if ui.button("Create").clicked() {
-                    data.fight = Some(Fight::new());
+                if end_combat {
+                    maybe_fight = None;
                 }
-            });
-        } 
+                fight_cloned = maybe_fight;
+            },
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label("There is not currently any map loaded. A fight requires a map to take place in. Use the ");
+                    if ui.link("map viewer").clicked() {
+                        (self.callback)(DMTab::MapViewer, true);
+                    }
+                    ui.label(" to load a map.");
+                });
+                fight_cloned = None;
+            },
+        }
+        if let Some((_, map)) = &mut data.loaded_map {
+            map.fight = fight_cloned;
+        }
     }
     fn parties(&mut self, ui: &mut Ui) {
         let data = &mut *self.data;
@@ -3662,354 +3699,6 @@ impl<'a, F: FnMut(DMTab, bool) + 'a> DMTabViewer<'a, F> {
             data.send_to_all_players(ClientBoundPacket::UpdateParties(data.parties.clone()));
         }
     }
-    // fn map_viewer(&mut self, ui: &mut Ui) {
-    //     let data = &mut *self.data;
-    //     if let Some((_, map, viewed_room)) = &mut data.loaded_map {
-    //         ui.horizontal(|ui| {
-    //             ui.heading(&map.name);
-    //             ui.add_space(5.0);
-    //             ui.checkbox(&mut data.temp_state.map_editing_mode, format!("{}", ep::NOTE_PENCIL)).on_hover_text("Edit mode");
-    //         });
-    //         let edit = data.temp_state.map_editing_mode;
-    //         ui.group(|ui| {
-    //             ui.label("Summary:");
-    //             if edit {
-    //                 ui.text_edit_multiline(&mut map.summary);
-    //             } else {
-    //                 if map.summary.is_empty() {
-    //                     ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                 } else {
-    //                     ui.label(&map.summary);
-    //                 }
-    //             }
-    //         });
-    //         let mut new_connection = None;
-    //         ui.group(|ui| {
-    //             if let Some(room_id) = viewed_room {
-    //                 let mut go_back = false;
-    //                 let room_list: Vec<String> = map.rooms.iter().map(|(id, _)| id.clone()).collect();
-    //                 if let Some(room) = map.rooms.get_mut(room_id) {
-    //                     ui.horizontal(|ui| {
-    //                         if back_arrow(ui) {
-    //                             go_back = true;
-    //                         }
-    //                         ui.heading(format!("Room {}{}", room_id, if room.name.is_empty() {String::new()} else {format!(" ({})", room.name)}));
-    //                     });
-    //                     if edit {
-    //                         ui.horizontal(|ui| {
-    //                             ui.strong("Room name:");
-    //                             ui.text_edit_singleline(&mut room.name);
-    //                         });
-    //                         ui.label(RichText::new("Room names are optional.").weak().italics());
-    //                     }
-    //                     ui.strong("Description:");
-    //                     if edit {
-    //                         ui.text_edit_multiline(&mut room.description);
-    //                     } else {
-    //                         if room.description.is_empty() {
-    //                             ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                         } else {
-    //                             ui.label(&room.description);
-    //                         }
-    //                     }
-    //                     ui.separator();
-    //                     ui.collapsing(RichText::new("Enemies").heading(), |ui| {
-    //                         for (_, (typ, group)) in &room.enemies {
-    //                             for (i, enemy) in group.iter().enumerate() {
-    //                                 ui.label(format!("- {} {} ({}/{})", typ.name, i + 1, enemy.combat_stats.health.current_hp, enemy.combat_stats.health.max_hp));
-    //                             }
-    //                         }
-    //                         if room.enemies.is_empty() {
-    //                             ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                         }
-    //                         if edit {
-    //                             ui.separator();
-    //                             ui.horizontal(|ui| {
-    //                                 ui.style_mut().spacing.item_spacing = vec2(0.0, 0.0);
-    //                                 ui.label("Use the ");
-    //                                 if ui.link("enemy viewer").clicked() {
-    //                                     data.temp_state.viewed_enemy = None;
-    //                                     (self.callback)(DMTab::EnemyViewer, true);
-    //                                 }
-    //                                 ui.label(" to add enemies.");
-    //                             });
-    //                         }
-    //                     });
-    //                     ui.collapsing(RichText::new("Items").heading(), |ui| {
-    //                         ui.collapsing(RichText::new("Loose Items").heading(), |ui| {
-    //                             let mut remove = None;
-    //                             for (i, item) in room.items.loose_items.iter().enumerate() {
-    //                                 ui.horizontal(|ui| {
-    //                                     ui.label(format!("- {} x{}", item.item_type.name, item.count));
-    //                                     if edit {
-    //                                         if x_button(ui) {
-    //                                             remove = Some(i);
-    //                                         }
-    //                                         ui.menu_button(RichText::new(format!("{}", ep::PACKAGE)).small(), |ui| {
-    //                                             for container in &mut room.items.containers {
-    //                                                 ui.menu_button(if container.name.is_empty() {"Unnamed Container"} else {container.name.as_str()}, |ui| {
-    //                                                     for (section, items) in &mut container.sections {
-    //                                                         if ui.button(section).clicked() {
-    //                                                             items.push(item.clone());
-    //                                                             remove = Some(i);
-    //                                                             ui.close_menu();
-    //                                                         }
-    //                                                     }
-    //                                                 });
-    //                                             }
-    //                                         }).response.on_hover_text("Move to container");
-    //                                     }
-    //                                 });
-    //                             }
-    //                             if let Some(i) = remove {
-    //                                 room.items.loose_items.remove(i);
-    //                             }
-    //                             if room.items.loose_items.is_empty() {
-    //                                 ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                             }
-    //                             if edit {
-    //                                 ui.separator();
-    //                                 ui.horizontal(|ui| {
-    //                                     ui.style_mut().spacing.item_spacing = vec2(0.0, 0.0);
-    //                                     ui.label("Use the ");
-    //                                     if ui.link("item viewer").clicked() {
-    //                                         data.temp_state.viewed_item = None;
-    //                                         (self.callback)(DMTab::ItemViewer, true);
-    //                                     }
-    //                                     ui.label(" to add items.");
-    //                                 });
-    //                             }
-    //                         });
-    //                         ui.collapsing(RichText::new("Containers").heading(), |ui| {
-    //                             for (i, container) in room.items.containers.iter_mut().enumerate() {
-    //                                 CollapsingHeader::new(if container.name.is_empty() {"Unnamed Container"} else {container.name.as_str()})
-    //                                     .id_source(("container", i))
-    //                                     .show(ui, |ui| {
-    //                                         if edit {
-    //                                             ui.horizontal(|ui| {
-    //                                                 ui.label("Name:");
-    //                                                 ui.text_edit_singleline(&mut container.name);
-    //                                             });
-    //                                         }
-    //                                         ui.horizontal(|ui| {
-    //                                             ui.heading("Sections");
-    //                                             if edit {
-    //                                                 ui.menu_button(RichText::new(format!("{}", ep::PLUS)).color(Color32::LIGHT_GREEN), |ui| {
-    //                                                     ui.add(TextEdit::singleline(&mut data.temp_state.temp_container_section).hint_text("Section name..."));
-    //                                                     if ui.button("Add section").clicked() {
-    //                                                         container.sections.insert(data.temp_state.temp_container_section.clone(), Vec::new());
-    //                                                         data.temp_state.temp_container_section.clear();
-    //                                                         ui.close_menu();
-    //                                                     }
-    //                                                 });
-    //                                             }
-    //                                         });
-    //                                         for (section, items) in &container.sections {
-    //                                             ui.collapsing(format!("Section: {}", section), |ui| {
-    //                                                 for item in &*items {
-    //                                                     ui.label(format!("- {} x{}", item.item_type.name, item.count));
-    //                                                 }
-    //                                                 if items.is_empty() {
-    //                                                     ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                                                 }
-    //                                             });
-    //                                         }
-    //                                     });
-    //                             }
-    //                             if room.items.containers.is_empty() {
-    //                                 ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                             }
-    //                             if edit {
-    //                                 ui.separator();
-    //                                 if ui.button("Add Container").clicked() {
-    //                                     room.items.containers.push(RoomContainer::new());
-    //                                 }
-    //                             }
-    //                         });
-    //                     });
-    //                     ui.collapsing(RichText::new("Connections").heading(), |ui| {
-    //                         if edit {
-    //                             ui.menu_button("New...", |ui| {
-    //                                 ui.checkbox(&mut data.temp_state.temp_room_connect_one_way, "One-way");
-    //                                 ui.menu_button("Leads to...", |ui| {
-    //                                     for id in &room_list {
-    //                                         if id != room_id {
-    //                                             if ui.button(id).clicked() {
-    //                                                 new_connection = Some((room_id.clone(), id.clone(), data.temp_state.temp_room_connect_one_way));
-    //                                                 data.temp_state.temp_room_connect_one_way = false;
-    //                                                 ui.close_menu();
-    //                                             }
-    //                                         }
-    //                                     }
-    //                                 });
-    //                             });
-    //                         }
-    //                         for (id, from) in &mut room.connections {
-    //                             if let Some(connection) = map.connections.get_mut(id) {
-    //                                 CollapsingHeader::new(format!("{} {}", ep::DOOR_OPEN, if *from {&connection.to} else {&connection.from}))
-    //                                     .id_source(id)
-    //                                     .show(ui, |ui| {
-    //                                         if edit {
-    //                                             ui.add(TextEdit::multiline(&mut connection.description).hint_text("Description..."));
-    //                                         } else {
-    //                                             if !connection.description.is_empty() {
-    //                                                 ui.label(RichText::new(&connection.description).weak().italics());
-    //                                             }
-    //                                         }
-    //                                         if connection.one_way {
-    //                                             ui.label("One-way");
-    //                                         }
-    //                                         ui.horizontal(|ui| {
-    //                                             if connection.passable {
-    //                                                 ui.label("Passable? Yes");
-    //                                                 if ui.small_button(format!("{}", ep::DOOR)).on_hover_text("Close").clicked() {
-    //                                                     connection.passable = false;
-    //                                                 }
-    //                                             } else {
-    //                                                 ui.label("Passable? No");
-    //                                                 ui.add_enabled_ui(!connection.locked, |ui| {
-    //                                                     if ui.small_button(format!("{}", ep::DOOR_OPEN))
-    //                                                         .on_hover_text("Open")
-    //                                                         .on_disabled_hover_text("Connection is locked")
-    //                                                         .clicked() {
-    //                                                         connection.passable = true;
-    //                                                     }
-    //                                                 });
-    //                                             }
-    //                                         });
-    //                                         ui.horizontal(|ui| {
-    //                                             if connection.locked {
-    //                                                 ui.label("Locked? Yes");
-    //                                                 if ui.small_button(format!("{}", ep::LOCK_KEY_OPEN)).on_hover_text("Unlock").clicked() {
-    //                                                     connection.locked = false;
-    //                                                 }
-    //                                             } else {
-    //                                                 ui.label("Locked? No");
-    //                                                 ui.add_enabled_ui(!connection.passable, |ui| {
-    //                                                     if ui.small_button(format!("{}", ep::LOCK_KEY))
-    //                                                         .on_hover_text("Lock")
-    //                                                         .on_disabled_hover_text("Connection is passable")
-    //                                                         .clicked() {
-    //                                                         connection.locked = true;
-    //                                                     }
-    //                                                 });
-    //                                             }
-    //                                         });
-    //                                         if let Some(trap) = &mut connection.trapped {
-    //                                             let mut remove_trap = false;
-    //                                             ui.horizontal(|ui| {
-    //                                                 ui.label("Trapped? Yes");
-    //                                                 if edit {
-    //                                                     if x_button(ui) {
-    //                                                         remove_trap = true;
-    //                                                     }
-    //                                                 }
-    //                                             });
-    //                                             ui.indent("trapped_connection", |ui| {
-    //                                                 if edit {
-    //                                                     ui.add(TextEdit::multiline(&mut trap.description).hint_text("Trap description..."));
-    //                                                 } else {
-    //                                                     if !trap.description.is_empty() {
-    //                                                         ui.label(RichText::new(&trap.description).weak().italics());
-    //                                                     }
-    //                                                 }
-    //                                                 if trap.active {
-    //                                                     ui.horizontal(|ui| {
-    //                                                         ui.label("Active? Yes");
-    //                                                         if ui.small_button(format!("{}", ep::ARROWS_CLOCKWISE)).on_hover_text("Deactivate").clicked() {
-    //                                                             trap.active = false;
-    //                                                         }
-    //                                                     });
-    //                                                 } else {
-    //                                                     ui.horizontal(|ui| {
-    //                                                         ui.label("Active? No");
-    //                                                         if ui.small_button(format!("{}", ep::ARROWS_CLOCKWISE)).on_hover_text("Activate").clicked() {
-    //                                                             trap.active = true;
-    //                                                         }
-    //                                                     });
-    //                                                 }
-    //                                             });
-    //                                             if remove_trap {
-    //                                                 connection.trapped = None;
-    //                                             }
-    //                                         } else {
-    //                                             ui.horizontal(|ui| {
-    //                                                 ui.label("Trapped? No");
-    //                                                 if edit {
-    //                                                     if ui.small_button("Make trapped").clicked() {
-    //                                                         connection.trapped = Some(RoomTrap::new());
-    //                                                     }
-    //                                                 }
-    //                                             });
-    //                                         }
-    //                                     });
-    //                             }
-    //                         }
-    //                         if room.connections.is_empty() {
-    //                             ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                         }
-    //                     });
-    //                 } else {
-    //                     *viewed_room = None;
-    //                 }
-    //                 if go_back {
-    //                     *viewed_room = None;
-    //                 }
-    //             } else {
-    //                 ui.horizontal(|ui| {
-    //                     ui.heading("Rooms");
-    //                     ui.add_space(5.0);
-    //                     if edit {
-    //                         ui.menu_button("New...", |ui| {
-    //                             ui.horizontal(|ui| {
-    //                                 ui.label("Room ID:");
-    //                                 ui.text_edit_singleline(&mut data.temp_state.temp_map_room_id);
-    //                             });
-    //                             if ui.button("Create").clicked() {
-    //                                 map.rooms.insert(data.temp_state.temp_map_room_id.clone(), Room::new());
-    //                                 data.temp_state.temp_map_room_id.clear();
-    //                                 ui.close_menu();
-    //                             }
-    //                         });
-    //                     }
-    //                 });
-    //                 for (room_id, room) in &map.rooms {
-    //                     let s = if room.name.is_empty() {
-    //                         format!("{}", room_id)
-    //                     } else {
-    //                         format!("{} ({})", room_id, room.name)
-    //                     };
-    //                     if ui.button(s).clicked() {
-    //                         *viewed_room = Some(room_id.clone());
-    //                     }
-    //                 }
-    //                 if map.rooms.is_empty() {
-    //                     ui.label(RichText::new("There's nothing here...").weak().italics());
-    //                 }
-    //             }
-    //         });
-    //         if let Some((from, to, one_way)) = new_connection {
-    //             let uuid = Uuid::new_v4().to_string();
-    //             map.connections.insert(uuid.clone(), {
-    //                 let mut c = RoomConnection::new();
-    //                 c.from = from.clone();
-    //                 c.to = to.clone();
-    //                 c.one_way = one_way;
-    //                 c
-    //             });
-    //             if let Some(from) = map.rooms.get_mut(&from) {
-    //                 from.connections.insert(uuid.clone(), true);
-    //             }
-    //             if !one_way {
-    //                 if let Some(to) = map.rooms.get_mut(&to) {
-    //                     to.connections.insert(uuid, false);
-    //                 } 
-    //             }
-    //         }
-    //     } else {
-
-    //     }
-    // }
     fn map_creator(&mut self, ui: &mut Ui) {
         let data = &mut *self.data;
         ui.horizontal(|ui| {
@@ -4122,9 +3811,6 @@ impl<F: FnMut(DMTab, bool)> TabViewer for DMTabViewer<'_, F> {
             DMTab::EnemyViewer => {
                 Self::enemy_viewer(ui, self.data);
             },
-            DMTab::DeployedEnemies => {
-                self.deployed_enemies(ui);
-            },
             DMTab::EnemyCreator => {
                 Self::enemy_creator(ui, self.data);
             },
@@ -4147,7 +3833,7 @@ impl<F: FnMut(DMTab, bool)> TabViewer for DMTabViewer<'_, F> {
                 Self::spell_creator(ui, self.data);
             },
             DMTab::ClassViewer => {
-                Self::class_viewer(ui, self.data);
+                self.class_viewer(ui);
             },
             DMTab::ClassCreator => {
                 Self::class_creator(ui, self.data);
@@ -4185,7 +3871,6 @@ pub enum DMTab {
     Chat,
     EnemyViewer,
     EnemyCreator,
-    DeployedEnemies,
     ItemViewer,
     ItemCreator,
     ProficiencyViewer,
@@ -4207,7 +3892,6 @@ impl std::fmt::Display for DMTab {
             Self::PlayerList => "Player List".to_owned(),
             Self::EnemyViewer => "Enemy Viewer".to_owned(),
             Self::EnemyCreator => "Enemy Creator".to_owned(),
-            Self::DeployedEnemies => "Deployed Enemies".to_owned(),
             Self::ItemViewer => "Item Viewer".to_owned(),
             Self::ItemCreator => "Item Creator".to_owned(),
             Self::ProficiencyViewer => "Proficiency Viewer".to_owned(),
@@ -4241,9 +3925,9 @@ impl std::fmt::Display for MapTab {
         write!(f, "{}", match self {
             Self::Main => ep::MAP_TRIFOLD.to_owned(),
             Self::Room(room) => format!("Room {}", room),
-            Self::RoomEnemies(room) => format!("Enemies (Room {})", room),
-            Self::RoomItems(room) => format!("Items (Room {})", room),
-            Self::RoomConnections(room) => format!("Connections (Room {})", room),
+            Self::RoomEnemies(room) => format!("{} (Room {})", ep::SWORD, room),
+            Self::RoomItems(room) => format!("{} (Room {})", ep::COINS, room),
+            Self::RoomConnections(room) => format!("{} (Room {})", ep::DOOR_OPEN, room),
         })
     }
 }
@@ -4309,9 +3993,16 @@ where
 
     fn main_tab(&mut self, ui: &mut Ui) {
         let data = &mut *self.data;
+        let mut unload = false;
         if let Some((_, map)) = &mut data.loaded_map {
             ui.horizontal(|ui| {
                 ui.heading(&map.name);
+                ui.menu_button("...", |ui| {
+                    if ui.button("Save and Unload").clicked() {
+                        unload = true;
+                        ui.close_menu();
+                    }
+                });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     Self::edit_mode(&mut data.temp_state, ui);
                 });
@@ -4365,6 +4056,9 @@ where
                 }
             }
         }
+        if unload {
+            data.save_and_unload_map();
+        }
     }
 
     fn room(&mut self, ui: &mut Ui, room_id: &String) {
@@ -4390,21 +4084,57 @@ where
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Enemies").size(16.0));
+                    ui.label(RichText::new(format!("{} Enemies", ep::SWORD)).size(16.0));
                     if link_button_frameless(ui) {
                         (self.callback_inner)(MapTab::RoomEnemies(room_id.clone()), true);
                     }
                 });
+                ui.indent("enemies", |ui| {
+                    if room.enemies.is_empty() {
+                        ui.label(RichText::new("None...").weak().italics());
+                    } else {
+                        for (_, (typ, group)) in &room.enemies {
+                            ui.label(format!("{} ({})", typ.name, group.len()));
+                        }
+                    }
+                });
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Items").size(16.0));
+                    ui.label(RichText::new(format!("{} Items", ep::COINS)).size(16.0));
                     if link_button_frameless(ui) {
                         (self.callback_inner)(MapTab::RoomItems(room_id.clone()), true);
                     }
                 });
+                ui.indent("items", |ui| {
+                    ui.label(format!("Loose: {}", room.items.loose_items.len()));
+                    ui.label(format!("Containers: {}", room.items.containers.len()));
+                });
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Connections").size(16.0));
+                    ui.label(RichText::new(format!("{} Connections", ep::DOOR_OPEN)).size(16.0));
                     if link_button_frameless(ui) {
                         (self.callback_inner)(MapTab::RoomConnections(room_id.clone()), true);
+                    }
+                });
+                ui.indent("connections", |ui| {
+                    for (uuid, from) in &room.connections {
+                        if let Some(connection) = map.connections.get(uuid) {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} {}", 
+                                    if connection.one_way {
+                                        ep::ARROW_RIGHT
+                                    } else {
+                                        ep::ARROWS_LEFT_RIGHT
+                                    },
+                                    if *from {
+                                        &connection.to
+                                    } else {
+                                        &connection.from
+                                    }
+                                ));
+                                if ui.add(egui::Button::new(RichText::new("\u{e972}").size(10.0)).small().frame(false)).clicked() {
+                                    (self.callback_inner)(MapTab::Room(if *from {connection.to.clone()} else {connection.from.clone()}), true);
+                                }
+                            });
+                        }
                     }
                 });
             } else {
@@ -4435,9 +4165,133 @@ where
                     });
                     ui.add_space(5.0);
                 }
-                for (_, (typ, group)) in &room.enemies {
-                    for (i, enemy) in group.iter().enumerate() {
-                        ui.label(format!("- {} {} ({}/{})", typ.name, i + 1, enemy.combat_stats.health.current_hp, enemy.combat_stats.health.max_hp));
+                for (enemy_id, (typ, group)) in &mut room.enemies {
+                    let mut remove = None;
+                    for (i, enemy) in group.iter_mut().enumerate() {
+                        CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id((enemy_id, i)), false)
+                            .show_header(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{} {} ({}/{})", typ.name, i + 1, enemy.combat_stats.health.current_hp, enemy.combat_stats.health.max_hp));
+                                    ui.menu_button("...", |ui| {
+                                        if ui.button("View Enemy Type").clicked() {
+                                            data.temp_state.viewed_enemy = Some(enemy_id.clone());
+                                            (self.callback_outer)(DMTab::EnemyViewer, true);
+                                            ui.close_menu();
+                                        }
+                                        if edit {
+                                            if ui.button("Remove").clicked() {
+                                                remove = Some(i);
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                });
+                            })
+                            .body(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    ui.label(format!("HP: {}/{}", enemy.combat_stats.health.current_hp, enemy.combat_stats.health.max_hp));
+                                    ui.add_space(4.0);
+                                    if ui.add(egui::Button::new("+").small().frame(false)).on_hover_text("Increase current HP").clicked() {
+                                        if enemy.combat_stats.health.current_hp < enemy.combat_stats.health.max_hp as i32 {
+                                            enemy.combat_stats.health.current_hp += 1;
+                                        }
+                                    }
+                                    if ui.add(egui::Button::new("-").small().frame(false)).on_hover_text("Decrease current HP").clicked() {
+                                        if enemy.combat_stats.health.current_hp > i32::MIN {
+                                            enemy.combat_stats.health.current_hp -= 1;
+                                        }
+                                    }
+                                    ui.add_space(6.0);
+                                    if edit {
+                                        if ui.add(egui::Button::new("+").small().frame(false)).on_hover_text("Increase max HP").clicked() {
+                                            if enemy.combat_stats.health.max_hp < u32::MAX {
+                                                enemy.combat_stats.health.max_hp += 1;
+                                            }
+                                        }
+                                        if ui.add(egui::Button::new("-").small().frame(false)).on_hover_text("Decrease max HP").clicked() {
+                                            if enemy.combat_stats.health.max_hp > 1 {
+                                                enemy.combat_stats.health.max_hp -= 1;
+                                                if enemy.combat_stats.health.current_hp > enemy.combat_stats.health.max_hp as i32 {
+                                                    enemy.combat_stats.health.current_hp = enemy.combat_stats.health.max_hp as i32;
+                                                }
+                                            }
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                    if ui.add(egui::Button::new(ep::HEART).small().frame(false)).on_hover_text("Restore HP to max").clicked() {
+                                        enemy.combat_stats.health.current_hp = enemy.combat_stats.health.max_hp as i32;
+                                    }
+                                    if edit {
+                                        if ui.add(egui::Button::new(ep::DICE_SIX).small().frame(false)).on_hover_text("Reroll max HP").clicked() {
+                                            enemy.combat_stats.health.max_hp = typ.hit_dice.roll();
+                                            enemy.combat_stats.health.current_hp = enemy.combat_stats.health.max_hp as i32;
+                                        }
+                                    }
+                                });
+                                ui.label(format!("AC: {}", enemy.combat_stats.armor_class + enemy.combat_stats.modifiers.armor_class.total()));
+                                ui.horizontal(|ui| {
+                                    ui.label("Status Effects:");
+                                    if edit {
+                                        plus_menu_button(ui, |ui| {
+                                            for effect in StatusEffect::iterate() {
+                                                ui.add_enabled_ui(!enemy.combat_stats.status_effects.is(effect), |ui| {
+                                                    if ui.button(format!("{}", effect)).clicked() {
+                                                        enemy.combat_stats.status_effects.effects.insert(effect);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                                ui.indent("status_effects", |ui| {
+                                    let mut remove_effect = None;
+                                    for effect in &enemy.combat_stats.status_effects.effects {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("- {}", effect));
+                                            if edit {
+                                                if trash_button_frameless(ui) {
+                                                    remove_effect = Some(*effect);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    if enemy.combat_stats.status_effects.effects.is_empty() {
+                                        ui.label("None");
+                                    }
+                                    if let Some(effect) = remove_effect {
+                                        enemy.combat_stats.status_effects.effects.remove(&effect);
+                                    }
+                                });
+                                ui.label("Saves:");
+                                ui.indent("saves", |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.label("P&P");
+                                            ui.label(format!("{:+}", enemy.combat_stats.saving_throws.petrification_paralysis + enemy.combat_stats.modifiers.save_petrification_paralysis.total()));
+                                        });
+                                        ui.vertical(|ui| {
+                                            ui.label("P&D");
+                                            ui.label(format!("{:+}", enemy.combat_stats.saving_throws.poison_death + enemy.combat_stats.modifiers.save_poison_death.total()));
+                                        });
+                                        ui.vertical(|ui| {
+                                            ui.label("B&B");
+                                            ui.label(format!("{:+}", enemy.combat_stats.saving_throws.blast_breath + enemy.combat_stats.modifiers.save_blast_breath.total()));
+                                        });
+                                        ui.vertical(|ui| {
+                                            ui.label("S&W");
+                                            ui.label(format!("{:+}", enemy.combat_stats.saving_throws.staffs_wands + enemy.combat_stats.modifiers.save_staffs_wands.total()));
+                                        });
+                                        ui.vertical(|ui| {
+                                            ui.label("Spells");
+                                            ui.label(format!("{:+}", enemy.combat_stats.saving_throws.spells + enemy.combat_stats.modifiers.save_spells.total()));
+                                        });
+                                    });
+                                });
+                            });
+                    }
+                    if let Some(index) = remove {
+                        group.remove(index);
                     }
                 }
             } else {
@@ -4446,24 +4300,407 @@ where
         }
     }
 
-    fn room_items(&mut self, _ui: &mut Ui, room_id: &String) {
+    fn room_items(&mut self, ui: &mut Ui, room_id: &String) {
         let data = &mut *self.data;
+        let mut packets = Vec::new();
         if let Some((_, map)) = &mut data.loaded_map {
-            if let Some(_room) = map.rooms.get_mut(room_id) {
-
+            if let Some(room) = map.rooms.get_mut(room_id) {
+                ui.horizontal(|ui| {
+                    ui.heading(format!("Items ({}{})", room_id, if room.name.is_empty() {"".to_owned()} else {format!("/{}", room.name)}));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        Self::edit_mode(&mut data.temp_state, ui);
+                    });
+                });
+                let edit = data.temp_state.map_editing_mode;
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Loose Items").size(18.0))
+                        .on_hover_text("These are all the items that aren't in a container. This could be lying on the floor or otherwise not contained.");
+                    if edit {
+                        plus_menu_button(ui, |ui| {
+                            if let Some((_, item)) = item_viewer_callback(ui, &data.item_type_registry, room_id) {
+                                room.items.loose_items.push(item);
+                            }
+                        });
+                    }
+                });
+                let mut remove = None;
+                for (i, item) in room.items.loose_items.iter_mut().enumerate() {
+                    CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id((i, "loose_items")), false)
+                        .show_header(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} x{}", item.item_type.name, item.count));
+                                ui.menu_button("...", |ui| {
+                                    if edit {
+                                        ui.add(egui::DragValue::new(&mut item.count).prefix("Count: ").clamp_range(1..=u32::MAX));
+                                    }
+                                    ui.menu_button("Give to...", |ui| {
+                                        for (username, user_data) in &mut data.user_data {
+                                            ui.menu_button(username, |ui| {
+                                                for (name, sheet) in &mut user_data.characters {
+                                                    if ui.button(name).clicked() {
+                                                        sheet.inventory.add(item.clone());
+                                                        packets.push((ClientBoundPacket::UpdateCharacter(name.clone(), sheet.clone()), username.clone()));
+                                                        remove = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                    ui.menu_button("Move to container...", |ui| {
+                                        for container in &mut room.items.containers {
+                                            ui.menu_button(if container.name.is_empty() {"(Unnamed Container)"} else {container.name.as_str()}, |ui| {
+                                                for (section, items) in &mut container.sections {
+                                                    if ui.button(format!("Section: {}", section)).clicked() {
+                                                        items.push(item.clone());
+                                                        remove = Some(i);
+                                                        ui.close_menu();
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                    if edit {
+                                        if ui.button("Remove").clicked() {
+                                            remove = Some(i);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            });
+                        })
+                        .body(|ui| {
+                            if edit {
+                                ui.add(TextEdit::singleline(&mut item.item_type.name).hint_text("Item name..."));
+                            }
+                            if edit {
+                                ui.add(TextEdit::multiline(&mut item.item_type.description).hint_text("Item description..."));
+                            } else if !item.item_type.description.is_empty() {
+                                ui.label(RichText::new(&item.item_type.description).weak().italics());
+                            }
+                            if edit {
+                                ui.add(egui::DragValue::new(&mut item.count).prefix("Count: ").clamp_range(1..=u32::MAX));
+                            }
+                            if edit {
+                                egui::ComboBox::from_label("Encumbrance")
+                                    .selected_text(item.item_type.encumbrance.display())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut item.item_type.encumbrance, Encumbrance::Negligible, Encumbrance::Negligible.display());
+                                        ui.selectable_value(&mut item.item_type.encumbrance, Encumbrance::Treasure, Encumbrance::Treasure.display());
+                                        ui.selectable_value(&mut item.item_type.encumbrance, Encumbrance::OneSixth, Encumbrance::OneSixth.display());
+                                        ui.selectable_value(&mut item.item_type.encumbrance, Encumbrance::OneHalf, Encumbrance::OneHalf.display());
+                                        ui.selectable_value(&mut item.item_type.encumbrance, Encumbrance::OneStone, Encumbrance::OneStone.display());
+                                        ui.selectable_value(&mut item.item_type.encumbrance, Encumbrance::VeryHeavy(1), "Very Heavy");
+                                    });
+                                if let Encumbrance::VeryHeavy(stone) = &mut item.item_type.encumbrance {
+                                    ui.add(egui::DragValue::new(stone).clamp_range(1..=u32::MAX).prefix("Weight (stone): "));
+                                }
+                            } else {
+                                ui.label(format!("Encumbrance: {}", item.item_type.encumbrance.display()));
+                            }
+                            ui.label(format!("Value: {:.1} sp", item.item_type.value.0))
+                                .on_hover_text(
+                                    RichText::new(format!("{:.1} cp\n{:.1} sp\n{:.1} ep\n{:.1} gp\n{:.1} pp", 
+                                        item.item_type.value.as_copper(),
+                                        item.item_type.value.as_silver(),
+                                        item.item_type.value.as_electrum(),
+                                        item.item_type.value.as_gold(),
+                                        item.item_type.value.as_platinum(),
+                                )).weak().italics());
+                        });
+                }
+                if let Some(index) = remove {
+                    room.items.loose_items.remove(index);
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Containers").size(18.0))
+                        .on_hover_text("Items that aren't loose must be in a container. This could be a chest, dresser, corpse, or even something like the surface of a table.");
+                    if edit {
+                        if plus_button(ui) {
+                            room.items.containers.push(RoomContainer::new());
+                        }
+                    }
+                });
+                for (i, container) in room.items.containers.iter_mut().enumerate() {
+                    ui.label(RichText::new(if container.name.is_empty() {"(Unnamed Container)"} else {container.name.as_str()}).size(16.0));
+                    ui.indent(i, |ui| {
+                        if edit {
+                            ui.add(TextEdit::singleline(&mut container.name).hint_text("Container name..."));
+                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                            ui.label("Locked?")
+                                .on_hover_text("A container is locked if its contents cannot be accessed trivially.");
+                            if container.locked {
+                                ui.colored_label(Color32::LIGHT_RED, " Yes  ");
+                                if ui.add(egui::Button::new(ep::LOCK_OPEN).frame(false)).on_hover_text("Unlock").clicked() {
+                                    container.locked = false;
+                                }
+                            } else {
+                                ui.colored_label(Color32::LIGHT_GREEN, " No  ");
+                                if ui.add(egui::Button::new(ep::LOCK).frame(false)).on_hover_text("Lock").clicked() {
+                                    container.locked = true;
+                                }
+                            }
+                        });
+                        let mut remove_trap = false;
+                        if let Some(trapped) = &mut container.trapped {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                ui.label("Trapped?");
+                                ui.colored_label(Color32::LIGHT_RED, " Yes  ");
+                                if edit {
+                                    if ui.button(RichText::new(ep::X).color(Color32::LIGHT_RED).small()).clicked() {
+                                        remove_trap = true;
+                                    }
+                                }
+                            });
+                            ui.indent((i, "trapped"), |ui| {
+                                if edit {
+                                    ui.add(TextEdit::multiline(&mut trapped.description).hint_text("Trap description..."));
+                                } else if !trapped.description.is_empty() {
+                                    ui.label(RichText::new(&trapped.description).weak().italics());
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                    ui.label("Active?")
+                                        .on_hover_text("A trap is active if it will trigger the next time its conditions are met.");
+                                    if trapped.active {
+                                        ui.colored_label(Color32::LIGHT_RED, " Yes  ");
+                                    } else {
+                                        ui.colored_label(Color32::LIGHT_GREEN, " No  ");
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new(ep::ARROWS_CLOCKWISE).small()).frame(false)).clicked() {
+                                        trapped.active = !trapped.active;
+                                    }
+                                });
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                ui.label("Trapped?");
+                                ui.colored_label(Color32::LIGHT_GREEN, " No  ");
+                                if edit {
+                                    if plus_button(ui) {
+                                        container.trapped = Some(RoomTrap::new());
+                                    }
+                                }
+                            });
+                        }
+                        if remove_trap {
+                            container.trapped = None;
+                        }
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Sections").size(15.0))
+                                .on_hover_text("Sections are a way to divide a container into multiple parts. For example, a chest could have a \"Main\" section as well as a \"Hidden Compartment\" section.");
+                            if edit {
+                                plus_menu_button(ui, |ui| {
+                                    ui.add(TextEdit::singleline(&mut data.temp_state.temp_container_section).hint_text("Section name..."));
+                                    if ui.button("Add section").clicked() {
+                                        container.sections.insert(data.temp_state.temp_container_section.clone(), Vec::new());
+                                        data.temp_state.temp_container_section.clear();
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        });
+                        for (section, items) in &mut container.sections {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!(" Section: {}", section)).size(14.0));
+                                if edit {
+                                    plus_menu_button(ui, |ui| {
+                                        if let Some((_, item)) = item_viewer_callback(ui, &data.item_type_registry, (room_id, i, section)) {
+                                            items.push(item);
+                                        }
+                                    });
+                                }
+                            });
+                            ui.indent((i, section), |ui| {
+                                for item in items {
+                                    ui.label(format!("- {} x{}", item.item_type.name, item.count));
+                                }
+                            });
+                        }
+                    });
+                }
             } else {
                 (self.callback_inner)(MapTab::RoomItems(room_id.clone()), false);
+            }
+            for (packet, user) in packets {
+                data.send_to_user(packet, user);
             }
         }
     }
 
-    fn room_connections(&mut self, _ui: &mut Ui, room_id: &String) {
+    fn room_connections(&mut self, ui: &mut Ui, room_id: &String) {
         let data = &mut *self.data;
         if let Some((_, map)) = &mut data.loaded_map {
-            if let Some(_room) = map.rooms.get_mut(room_id) {
-
+            let room_list: Vec<(String, String)> = map.rooms.iter().filter_map(|(id, room)| {
+                if id == room_id {
+                    None
+                } else {
+                    Some((id.clone(), room.name.clone()))
+                }
+            }).collect();
+            let mut new_connection = None;
+            if let Some(room) = map.rooms.get_mut(room_id) {
+                ui.horizontal(|ui| {
+                    ui.heading(format!("Connections ({}{})", room_id, if room.name.is_empty() {"".to_owned()} else {format!("/{}", room.name)}));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        Self::edit_mode(&mut data.temp_state, ui);
+                    });
+                });
+                let edit = data.temp_state.map_editing_mode;
+                ui.separator();
+                if edit {
+                    ui.menu_button("Add...", |ui| {
+                        ui.checkbox(&mut data.temp_state.temp_room_connect_one_way, "One-Way")
+                            .on_hover_text("A one-way connection cannot be traversed backwards, like a teleporter trap or a fall downwards.");
+                        ui.menu_button("Leads to...", |ui| {
+                            for (id, name) in room_list {
+                                if ui.button(format!("{} ({})", id, name)).clicked() {
+                                    new_connection = Some((id, data.temp_state.temp_room_connect_one_way));
+                                    data.temp_state.temp_room_connect_one_way = false;
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(5.0);
+                }
+                for (uuid, &from) in &room.connections {
+                    if let Some(connection) = map.connections.get_mut(uuid) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(
+                                format!("{} {}", 
+                                if connection.one_way {ep::ARROW_RIGHT} else {ep::ARROWS_LEFT_RIGHT},
+                                if from {&connection.to} else {&connection.from}
+                            )).size(18.0));
+                            if link_button_frameless(ui) {
+                                (self.callback_inner)(MapTab::Room(if from {connection.to.clone()} else {connection.from.clone()}), true);
+                            }
+                        });
+                        ui.indent(uuid, |ui| {
+                            if edit {
+                                ui.add(TextEdit::multiline(&mut connection.description).hint_text("Description..."));
+                            } else if !connection.description.is_empty() {
+                                ui.label(RichText::new(&connection.description).weak().italics());
+                            }
+                            if connection.one_way {
+                                ui.label("One-Way")
+                                    .on_hover_text(format!("This connection cannot be traversed backwards (going from room {} to {}).", connection.to, connection.from));
+                            } else {
+                                ui.label("Two-Way")
+                                    .on_hover_text("This connection can be traversed from both directions.");
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                ui.label("Passable?")
+                                    .on_hover_text("A connection is passable if someone can walk through it without needing to interact with it (e.g. an open door). Connections cannot be both passable and locked.");
+                                if connection.passable {
+                                    ui.colored_label(Color32::LIGHT_GREEN, " Yes  ");
+                                    if ui.add(egui::Button::new(ep::DOOR).frame(false)).on_hover_text("Close").clicked() {
+                                        connection.passable = false;
+                                    }
+                                } else {
+                                    ui.colored_label(Color32::LIGHT_RED, " No  ");
+                                    ui.add_enabled_ui(!connection.locked, |ui| {
+                                        if ui.add(egui::Button::new(ep::DOOR_OPEN).frame(false)).on_hover_text("Open").on_disabled_hover_text("Connection is locked").clicked() {
+                                            connection.passable = true;
+                                        }
+                                    });
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                ui.label("Locked?")
+                                    .on_hover_text("A connection is locked if it cannot trivially be made passable (i.e. it requires a key, dice roll, etc). Connections cannot be both locked and passable.");
+                                if connection.locked {
+                                    ui.colored_label(Color32::LIGHT_RED, " Yes  ");
+                                    if ui.add(egui::Button::new(ep::LOCK_OPEN).frame(false)).on_hover_text("Unlock").clicked() {
+                                        connection.locked = false;
+                                    }
+                                } else {
+                                    ui.colored_label(Color32::LIGHT_GREEN, " No  ");
+                                    ui.add_enabled_ui(!connection.passable, |ui| {
+                                        if ui.add(egui::Button::new(ep::LOCK).frame(false)).on_hover_text("Lock").on_disabled_hover_text("Connection is passable").clicked() {
+                                            connection.locked = true;
+                                        }
+                                    });
+                                }
+                            });
+                            let mut remove_trap = false;
+                            if let Some(trapped) = &mut connection.trapped {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                    ui.label("Trapped?");
+                                    ui.colored_label(Color32::LIGHT_RED, " Yes  ");
+                                    if edit {
+                                        if ui.button(RichText::new(ep::X).color(Color32::LIGHT_RED).small()).clicked() {
+                                            remove_trap = true;
+                                        }
+                                    }
+                                });
+                                ui.indent((uuid, "trapped"), |ui| {
+                                    if edit {
+                                        ui.add(TextEdit::multiline(&mut trapped.description).hint_text("Trap description..."));
+                                    } else if !trapped.description.is_empty() {
+                                        ui.label(RichText::new(&trapped.description).weak().italics());
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                        ui.label("Active?")
+                                            .on_hover_text("A trap is active if it will trigger the next time its conditions are met.");
+                                        if trapped.active {
+                                            ui.colored_label(Color32::LIGHT_RED, " Yes  ");
+                                        } else {
+                                            ui.colored_label(Color32::LIGHT_GREEN, " No  ");
+                                        }
+                                        if ui.add(egui::Button::new(RichText::new(ep::ARROWS_CLOCKWISE).small()).frame(false)).clicked() {
+                                            trapped.active = !trapped.active;
+                                        }
+                                    });
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                                    ui.label("Trapped?");
+                                    ui.colored_label(Color32::LIGHT_GREEN, " No  ");
+                                    if edit {
+                                        if plus_button(ui) {
+                                            connection.trapped = Some(RoomTrap::new());
+                                        }
+                                    }
+                                });
+                            }
+                            if remove_trap {
+                                connection.trapped = None;
+                            }
+                        });
+                    }
+                }
             } else {
                 (self.callback_inner)(MapTab::RoomConnections(room_id.clone()), false);
+            }
+            if let Some((to, one_way)) = new_connection {
+                let uuid = uuid::Uuid::new_v4().to_string();
+                map.connections.insert(uuid.clone(), {
+                    let mut c = RoomConnection::new();
+                    c.from = room_id.clone();
+                    c.to = to.clone();
+                    c.one_way = one_way;
+                    c
+                });
+                if let Some(room) = map.rooms.get_mut(room_id) {
+                    room.connections.insert(uuid.clone(), true);
+                }
+                if !one_way {
+                    if let Some(room) = map.rooms.get_mut(&to) {
+                        room.connections.insert(uuid, false);
+                    }
+                }
             }
         }
     }

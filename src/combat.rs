@@ -1,9 +1,10 @@
-use std::{collections::{HashMap, hash_map::Iter, HashSet}, ops::{AddAssign, SubAssign}, cmp::Ordering};
+use std::{collections::{HashMap, hash_map::Iter, HashSet, BTreeSet}, ops::{AddAssign, SubAssign}, cmp::Ordering};
 
+use displaydoc::Display;
 use serde::{Serialize, Deserialize};
 use simple_enum_macro::simple_enum;
 
-use crate::{character::{Attributes, Health, SavingThrows}, dm_app::DMAppData, packets::{ClientBoundPacket}, dice::{self, DiceRoll}, enemy::AttackRoutine, common_ui::ChatMessage, spell::MagicType, player_app::{CombatRoundState, CombatState}};
+use crate::{character::{Attributes, Health, SavingThrows}, dm_app::DMAppData, packets::ClientBoundPacket, dice::{self, DiceRoll}, enemy::AttackRoutine, common_ui::ChatMessage, spell::MagicType, player_app::{CombatRoundState, CombatState}};
 
 /// All the stats required for something to engage in combat. All of these are *base* stats, before
 /// any modifiers! This means `armor_class` will be zero for most characters, unless they have 
@@ -185,13 +186,30 @@ impl StatusEffects {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[simple_enum(display)]
 pub enum StatusEffect {
+    /// Dead
     Dead,
+    /// Dying
     Dying,
+    /// Sleeping
     Sleeping,
+    /// Paralyzed
     Paralyzed,
+    /// Concentrating
     Concentrating,
+}
+
+impl StatusEffect {
+    pub fn iterate() -> Vec<StatusEffect> {
+        vec![
+            Self::Dead,
+            Self::Dying,
+            Self::Sleeping,
+            Self::Paralyzed,
+            Self::Concentrating,
+        ]
+    }
 }
 
 #[simple_enum(display)]
@@ -452,7 +470,7 @@ impl std::fmt::Display for TurnType {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Fight {
     pub started: bool,
-    pub combatants: HashSet<(Owner, Combatant)>,
+    pub combatants: BTreeSet<(Owner, Combatant)>,
     pub declarations: HashMap<Combatant, PreRoundAction>,
     pub turn_order: Vec<(Owner, Combatant, PreRoundAction)>,
     pub current_turn: Option<(usize, TurnType)>,
@@ -462,7 +480,7 @@ impl Fight {
     pub fn new() -> Self {
         Self {
             started: false,
-            combatants: HashSet::new(),
+            combatants: BTreeSet::new(),
             declarations: HashMap::new(),
             turn_order: Vec::new(),
             current_turn: None,
@@ -647,47 +665,6 @@ impl Fight {
             None => {},
         }
         self.update_clients(data);
-        // if let Some((owner, ctype)) = self.turn_order.get_mut(self.current_turn) {
-        //     if data.get_combatant_stats_alt(ctype, |s| s.status_effects.is_incapacitated()).unwrap_or(false) {
-        //         data.log(ChatMessage::no_sender(format!("{} is unable to act!", ctype.name())).combat());
-        //         self.current_turn += 1;
-        //         return;
-        //     }
-        //     if data.get_combatant_stats_alt(ctype, |s| s.attack_index).unwrap_or(0) == 0 {
-        //         data.log(ChatMessage::no_sender(format!("It is {}'s turn!", ctype.name())).combat());
-        //     }
-        //     let mut list = vec![];
-        //     for (ow, comb) in &self.combatants {
-        //         if comb.id() == ctype.id() || ow == owner {
-        //             continue;
-        //         }
-        //         if data.get_combatant_stats_alt(comb, |c| c.status_effects.is_untargetable()).unwrap_or(true) {
-        //             continue;
-        //         }
-        //         list.push(comb.clone());
-        //     }
-        //     if let Owner::Player(p) = &owner {
-        //         if !data.connected_users.contains_key(p) {
-        //             *owner = Owner::DM;
-        //         }
-        //     }
-        //     match owner {
-        //         Owner::DM => {
-        //             data.temp_state.selected_target = 0;
-        //             data.temp_state.combatant_list = list;
-        //         },
-        //         Owner::Player(player) => {
-        //             data.temp_state.selected_target = 0;
-        //             data.temp_state.combatant_list = list.clone();
-        //             data.send_to_user(ClientBoundPacket::DecideCombatAction(ctype.clone(), list), player.clone());
-        //         },
-        //     }
-        //     self.awaiting_response = Some(owner.clone());
-        // } else {
-        //     self.current_turn = 0;
-        //     data.log(ChatMessage::no_sender("Round concluded!").combat());
-        //     self.ongoing_round = false;
-        // }
     }
 
     pub fn resolve_action(&mut self, data: &mut DMAppData) {
@@ -700,31 +677,31 @@ impl Fight {
                                 self.next_turn(data);
                             },
                             MovementAction::Move => {
-                                data.log(ChatMessage::no_sender(format!("{} moves.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} moves.", actor)).combat());
                                 self.next_turn(data);
                             },
                             MovementAction::Run => {
-                                data.log(ChatMessage::no_sender(format!("{} runs.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} runs.", actor)).combat());
                                 *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
                                 self.next_turn(data);
                             },
                             MovementAction::Charge => {
-                                data.log(ChatMessage::no_sender(format!("{} charges.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} charges.", actor)).combat());
                                 *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
                                 self.next_turn(data);
                             },
                             MovementAction::FightingWithdrawal => {
-                                data.log(ChatMessage::no_sender(format!("{} makes a fighting withdrawal.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} makes a fighting withdrawal.", actor)).combat());
                                 *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
                                 self.next_turn(data);
                             },
                             MovementAction::FullRetreat => {
-                                data.log(ChatMessage::no_sender(format!("{} makes a full retreat.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} makes a full retreat.", actor)).combat());
                                 *turn_type = TurnType::Attack {action: AttackAction::None, player_action: None};
                                 self.next_turn(data);
                             },
                             MovementAction::SimpleAction => {
-                                data.log(ChatMessage::no_sender(format!("{} performs a simple action.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} performs a simple action.", actor)).combat());
                                 self.next_turn(data);
                             },
                         }
@@ -741,12 +718,12 @@ impl Fight {
                                 self.make_attack(data, &actor, &target, modifier);
                             },
                             AttackAction::SpecialManeuver(target, maneuver, _modifier) => {
-                                data.log(ChatMessage::no_sender(format!("{} tries to {} {}!", actor.name(), maneuver, target.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} tries to {} {}!", actor, maneuver, target)).combat());
                                 self.next_turn(data);
                             },
                             AttackAction::CastSpell => {
                                 if let PreRoundAction::CastSpell(id, lvl, typ) = dec {
-                                    if let Combatant::PC(user, name) = actor {
+                                    if let Combatant::PC { user, name } = actor {
                                         data.apply_to_pc(user, name, |sheet| {
                                             match typ {
                                                 MagicType::Arcane => {
@@ -760,14 +737,14 @@ impl Fight {
                                             }
                                         });
                                     }
-                                    data.log(ChatMessage::no_sender(format!("{} casts {}!", actor.name(), data.spell_registry.get_spell_name_or_default(id, *lvl, *typ))).combat());
+                                    data.log(ChatMessage::no_sender(format!("{} casts {}!", actor, data.spell_registry.get_spell_name_or_default(id, *lvl, *typ))).combat());
                                 } else {
                                     data.log(ChatMessage::no_sender(format!("{} tries to cast a spell that they didn't declare.", actor)).combat().light_red());
                                 }
                                 self.next_turn(data);
                             },
                             AttackAction::OtherAction => {
-                                data.log(ChatMessage::no_sender(format!("{} performs a simple action.", actor.name())).combat());
+                                data.log(ChatMessage::no_sender(format!("{} performs a simple action.", actor)).combat());
                                 self.next_turn(data);
                             },
                         }
@@ -783,17 +760,17 @@ impl Fight {
         match attack_roll(data, attacker, target, modifier) {
             AttackResult::CriticalFail => {
                 let msg = match dice::roll(DiceRoll::simple(1, 6)) {
-                    ..=1 => format!("{} failed miserably when attacking {}!", attacker.name(), target.name()),
-                    2 => format!("{} critically missed {}!", attacker.name(), target.name()),
-                    3 => format!("{} utterly whiffed an attempt to hit {}!", attacker.name(), target.name()),
-                    4 => format!("{} absolutely annihilated the air nearby to {}.", attacker.name(), target.name()),
-                    5 => format!("Whatever {} tried to do to {}, it didn\'t work very well.", attacker.name(), target.name()),
-                    6.. => format!("{} lands a devastating warning blow toward {}! It did absolutely nothing.", attacker.name(), target.name()),
+                    ..=1 => format!("{} failed miserably when attacking {}!", attacker, target),
+                    2 => format!("{} critically missed {}!", attacker, target),
+                    3 => format!("{} utterly whiffed an attempt to hit {}!", attacker, target),
+                    4 => format!("{} absolutely annihilated the air nearby to {}.", attacker, target),
+                    5 => format!("Whatever {} tried to do to {}, it didn\'t work very well.", attacker, target),
+                    6.. => format!("{} lands a devastating warning blow toward {}! It did absolutely nothing.", attacker, target),
                 };
                 data.log(ChatMessage::no_sender(msg).combat().dice_roll());
             },
             AttackResult::Fail => {
-                data.log(ChatMessage::no_sender(format!("{} missed {}!", attacker.name(), target.name())).combat().dice_roll());
+                data.log(ChatMessage::no_sender(format!("{} missed {}!", attacker, target)).combat().dice_roll());
             },
             AttackResult::Success => {
                 let damage = damage_roll(data, attacker, false);
@@ -803,9 +780,9 @@ impl Fight {
                         killed = stats.hurt(damage as u32);
                     }
                 });
-                data.log(ChatMessage::no_sender(format!("{} hit {} for {} damage!", attacker.name(), target.name(), damage)).combat().dice_roll());
+                data.log(ChatMessage::no_sender(format!("{} hit {} for {} damage!", attacker, target, damage)).combat().dice_roll());
                 if killed {
-                    data.log(ChatMessage::no_sender(format!("{} was killed!", target.name())).combat().red());
+                    data.log(ChatMessage::no_sender(format!("{} was killed!", target)).combat().red());
                 }
             },
             AttackResult::CriticalSuccess => {
@@ -817,16 +794,16 @@ impl Fight {
                     }
                 });
                 let msg = match dice::roll(DiceRoll::simple(1, 6)) {
-                    ..=1 => format!("{} critically hit {} for a whopping {} damage!", attacker.name(), target.name(), damage),
-                    2 => format!("{} absolutely devastated {} for {} damage!", attacker.name(), target.name(), damage),
-                    3 => format!("{} expertly struck {} for {} damage!", attacker.name(), target.name(), damage),
-                    4 => format!("{} showed {} who\'s boss. It did {} damage!", attacker.name(), target.name(), damage),
-                    5 => format!("{} obliterated {} for a staggering {} damage!", attacker.name(), target.name(), damage),
-                    6.. => format!("{} asked nicely for {} to go away. With force. It did {} damage!", attacker.name(), target.name(), damage),
+                    ..=1 => format!("{} critically hit {} for a whopping {} damage!", attacker, target, damage),
+                    2 => format!("{} absolutely devastated {} for {} damage!", attacker, target, damage),
+                    3 => format!("{} expertly struck {} for {} damage!", attacker, target, damage),
+                    4 => format!("{} showed {} who\'s boss. It did {} damage!", attacker, target, damage),
+                    5 => format!("{} obliterated {} for a staggering {} damage!", attacker, target, damage),
+                    6.. => format!("{} asked nicely for {} to go away. With force. It did {} damage!", attacker, target, damage),
                 };
                 data.log(ChatMessage::no_sender(msg).combat().dice_roll());
                 if killed {
-                    data.log(ChatMessage::no_sender(format!("{} was killed!", target.name())).combat().red());
+                    data.log(ChatMessage::no_sender(format!("{} was killed!", target)).combat().red());
                 }
             },
         }
@@ -914,7 +891,7 @@ pub enum AttackResult {
 
 /// Represents who actually gets to make the decisions for this combatant; i.e. who is currently
 /// in control of them (PC's are not always controlled by players, for example if they are charmed).
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Owner {
     DM,
     Player(String),
@@ -928,61 +905,38 @@ pub enum Owner {
 /// - `Enemy.2`: The enemy type name, so it doesn't have to be looked up constantly.
 /// - `PC.0`: The player username.
 /// - `PC.1`: The player character name.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Display, PartialOrd, Ord)]
 pub enum Combatant {
-    Enemy(String, u32, String),
-    PC(String, String),
+    /// {display_name}
+    Enemy {
+        room: String,
+        type_id: String,
+        index: usize,
+        display_name: String,
+    },
+    /// {name}
+    PC {
+        user: String,
+        name: String,
+    },
 }
 
 impl Combatant {
-    /// Gets the formatted display name for this combatant.
-    pub fn name(&self) -> String {
-        match self {
-            Self::Enemy(_, id, name) => {
-                if *id == 0 {
-                    name.clone()
-                } else {
-                    format!("{} {}", name, id + 1)
-                }
-            },
-            Self::PC(_, character) => {
-                character.clone()
-            },
-        }
-    }
-
-    /// Gets a string that can uniquely identify this combatant.
-    pub fn id(&self) -> String {
-        match self {
-            Self::Enemy(type_id, id, _) => {
-                format!("{}_{}", type_id, id)
-            },
-            Self::PC(_, character) => {
-                character.clone()
-            },
-        }
-    }
-
     /// A combatant that doesn't exist, in case of an error.
     pub fn not_found() -> Self {
-        Self::PC("server".to_owned(), "Nonexistent combatant. If you see this, something has gone wrong.".to_owned())
+        Self::pc("server".to_owned(), "Nonexistent combatant. If you see this, something has gone wrong.".to_owned())
     }
-}
 
-impl std::fmt::Display for Combatant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Combatant::Enemy(_, n, name) => {
-                if *n > 0 {
-                    write!(f, "{} {}", name, *n + 1)
-                } else {
-                    write!(f, "{}", name)
-                }
-            },
-            Combatant::PC(_, name) => {
-                write!(f, "{}", name)
-            },
-        }
+    pub fn enemy(room: String, type_id: String, index: usize, display_name: String) -> Self {
+        Self::Enemy { room, type_id, index, display_name }
+    }
+
+    pub fn enemy_auto_name(room: String, type_id: String, index: usize, type_name: String) -> Self {
+        Self::enemy(room, type_id, index, if index == 0 {type_name} else {format!("{} {}", type_name, index + 1)})
+    }
+
+    pub fn pc(user: String, name: String) -> Self {
+        Self::PC { user, name }
     }
 }
 
@@ -1034,10 +988,10 @@ impl AttackAction {
     pub fn display_alt(&self) -> String {
         match self {
             Self::Attack(target, _) => {
-                format!("Attack {}", target.name())
+                format!("Attack {}", target)
             },
             Self::SpecialManeuver(target, maneuver, _) => {
-                format!("{} {}", maneuver, target.name())
+                format!("{} {}", maneuver, target)
             },
             _ => format!("{}", self)
         }
